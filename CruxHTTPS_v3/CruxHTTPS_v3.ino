@@ -455,7 +455,7 @@ void registerWithRetry()
 #if CRUX_USE_JSONDOC_V6
   StaticJsonDocument<JSON_DOC_CAPACITY> doc;
 #else
-  JsonDocument doc(JSON_DOC_CAPACITY);
+  JsonDocument doc;
 #endif
   doc["deviceId"] = DEVICE_ID;
   doc["deviceSecret"] = DEVICE_SECRET;
@@ -492,7 +492,7 @@ bool sendSensorData()
 #if CRUX_USE_JSONDOC_V6
   StaticJsonDocument<JSON_DOC_CAPACITY> doc;
 #else
-  JsonDocument doc(JSON_DOC_CAPACITY);
+  JsonDocument doc;
 #endif
   doc["temperature"] = round1(sensorTemp);
   doc["voltage"] = round2(sensorVoltage);
