@@ -72,7 +72,7 @@
 #define ADAPTIVE_LOOP_DELAY true
 #define LOOP_DELAY_MIN_MS 50
 
-#define SEND_INTERVAL_MS 600000UL
+#define SEND_INTERVAL_MS 60000UL
 
 #define REGISTER_RETRY_MS 10000
 #define NETWORK_TIMEOUT_MS 180000
@@ -93,7 +93,7 @@
 #define HTTP_RESP_BODY_MAX 256
 
 // ─────────────────────────────────────────────────────────────────
-#define ENABLE_DEBUG false
+#define ENABLE_DEBUG true
 #define SERIAL_BAUD 115200
 // #define DUMP_AT_COMMANDS
 
