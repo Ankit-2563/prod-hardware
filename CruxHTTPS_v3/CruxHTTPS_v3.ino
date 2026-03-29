@@ -187,7 +187,7 @@ void initSensors()
 
   pinMode(ACS712_PIN, INPUT);
   pinMode(ZMPT101B_PIN, INPUT);
-  LOG("[SENSOR] ✓ Ready\n");
+  LOG("[SENSOR] Ready\n");
 }
 
 void readAllSensors()
@@ -224,7 +224,7 @@ void readAllSensors()
   }
   else
   {
-    LOG("[SENSOR]   ⚠ ALL temp sensors failed — soft-reset DHT drivers");
+    LOG("[SENSOR]   ALL temp sensors failed — soft-reset DHT drivers");
     for (int i = 0; i < TEMP_SENSOR_COUNT; i++)
       dhtSensors[i].begin();
   }
@@ -233,7 +233,7 @@ void readAllSensors()
   if (!isnan(h))
     sensorHumid = h;
   else
-    LOG("[SENSOR]   ⚠ Humidity read failed, using previous value");
+    LOG("[SENSOR]   Humidity read failed, using previous value");
 
   esp_task_wdt_reset();
 
@@ -388,9 +388,9 @@ void initModem()
   SerialAT.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
   LOG("[MODEM] Initializing...");
   if (!modem.init())
-    LOG("[MODEM] ⚠ init() failed — trying restart()");
+    LOG("[MODEM] init() failed — trying restart()");
   if (!modem.restart())
-    LOG("[MODEM] ⚠ restart() failed — continuing");
+    LOG("[MODEM] restart() failed — continuing");
 
   String name = modem.getModemName();
   String info = modem.getModemInfo();
@@ -399,7 +399,7 @@ void initModem()
 #if USE_HTTPS
   LOG("[MODEM] TLS: modem hardware stack");
 #endif
-  LOG("[MODEM] ✓ Ready\n");
+  LOG("[MODEM] Ready\n");
 }
 
 void waitForNetwork()
@@ -411,7 +411,7 @@ void waitForNetwork()
     delay(30000);
     ESP.restart();
   }
-  LOGF("[NET] ✓ Registered (signal: %d/31)\n", modem.getSignalQuality());
+  LOGF("[NET] Registered (signal: %d/31)\n", modem.getSignalQuality());
 }
 
 void connectGPRS()
@@ -426,20 +426,20 @@ void connectGPRS()
       ESP.restart();
     }
   }
-  LOG("[NET] ✓ GPRS connected — IP: " + modem.getLocalIP());
+  LOG("[NET] GPRS connected — IP: " + modem.getLocalIP());
 }
 
 void ensureConnected()
 {
   if (!modem.isNetworkConnected())
   {
-    LOG("[NET] ⚠ Network lost — reconnecting");
+    LOG("[NET] Network lost — reconnecting");
     waitForNetwork();
     connectGPRS();
   }
   if (!modem.isGprsConnected())
   {
-    LOG("[NET] ⚠ GPRS lost — reconnecting");
+    LOG("[NET] GPRS lost — reconnecting");
     connectGPRS();
   }
 }
@@ -466,7 +466,7 @@ void registerWithRetry()
   size_t jsonLen = serializeJson(doc, jsonBuf, sizeof(jsonBuf));
   if (jsonLen == 0 || jsonLen >= sizeof(jsonBuf))
   {
-    LOG("[REG] ✗ JSON serialize error or buffer full");
+    LOG("[REG] JSON serialize error or buffer full");
     return;
   }
 
@@ -476,13 +476,13 @@ void registerWithRetry()
     if (code == 200 || code == 201)
     {
       registered = true;
-      LOG("[REG] ✓ Registered\n");
+      LOG("[REG] Registered\n");
       return;
     }
-    LOGF("[REG] ✗ Attempt %d failed (HTTP %d)\n", i, code);
+    LOGF("[REG] Attempt %d failed (HTTP %d)\n", i, code);
     delay(REGISTER_RETRY_MS);
   }
-  LOG("[REG] ✗ Will retry in main loop\n");
+  LOG("[REG] Will retry in main loop\n");
 }
 
 bool sendSensorData()
@@ -504,7 +504,7 @@ bool sendSensorData()
   size_t jsonLen = serializeJson(doc, jsonBuf, sizeof(jsonBuf));
   if (jsonLen == 0 || jsonLen >= sizeof(jsonBuf))
   {
-    LOG("[DATA] ✗ JSON serialize error");
+    LOG("[DATA] JSON serialize error");
     return false;
   }
 
@@ -514,11 +514,11 @@ bool sendSensorData()
 
   if (code == 201)
   {
-    LOG("[DATA] ✓ 201\n");
+    LOG("[DATA] 201\n");
     return true;
   }
 
-  LOGF("[DATA] ✗ HTTP %d\n", code);
+  LOGF("[DATA] HTTP %d\n", code);
   if (code == 404)
     registered = false;
   return false;
@@ -538,7 +538,7 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
     LOGF("[HTTP] Connect %s:%d\n", SERVER_HOST, SERVER_PORT);
     if (!netClient.connect(SERVER_HOST, SERVER_PORT))
     {
-      LOG("[HTTP] ✗ TCP failed");
+      LOG("[HTTP] TCP failed");
       netClient.stop();
       continue;
     }
@@ -555,7 +555,7 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
 
     if (h <= 0 || (size_t)h >= sizeof(hdrs) - 96)
     {
-      LOG("[HTTP] ✗ header base truncated");
+      LOG("[HTTP] header base truncated");
       netClient.stop();
       continue;
     }
@@ -569,7 +569,7 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
           devId, devSecret);
       if (a <= 0 || pos + a >= (int)sizeof(hdrs) - 8)
       {
-        LOG("[HTTP] ✗ auth header truncated");
+        LOG("[HTTP] auth header truncated");
         netClient.stop();
         continue;
       }
@@ -593,7 +593,7 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
 
     if (!netClient.available())
     {
-      LOG("[HTTP] ✗ timeout");
+      LOG("[HTTP] timeout");
       netClient.stop();
       continue;
     }
@@ -630,7 +630,7 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
       return statusCode;
   }
 
-  LOG("[HTTP] ✗ all retries failed");
+  LOG("[HTTP] all retries failed");
   return -1;
 }
 

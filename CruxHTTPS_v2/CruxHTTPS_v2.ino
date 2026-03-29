@@ -120,8 +120,7 @@ void setup()
   esp_task_wdt_config_t wdt_config = {
       .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
       .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
-      .trigger_panic = true
-  };
+      .trigger_panic = true};
   esp_task_wdt_init(&wdt_config);
   esp_task_wdt_add(NULL);
 #else
@@ -199,7 +198,7 @@ void initSensors()
   pinMode(ZMPT101B_PIN, INPUT);
   LOGF("[SENSOR]   ZMPT101B on GPIO %d\n", ZMPT101B_PIN);
 
-  LOG("[SENSOR] ✓ Ready\n");
+  LOG("[SENSOR]  Ready\n");
 }
 
 void readAllSensors()
@@ -237,8 +236,9 @@ void readAllSensors()
   }
   else
   {
-    LOG("[SENSOR]   ⚠ ALL temp sensors failed — attempting soft reset and using previous value");
-    for (int i = 0; i < TEMP_SENSOR_COUNT; i++) {
+    LOG("[SENSOR]    ALL temp sensors failed — attempting soft reset and using previous value");
+    for (int i = 0; i < TEMP_SENSOR_COUNT; i++)
+    {
       dhtSensors[i].begin();
     }
   }
@@ -249,7 +249,7 @@ void readAllSensors()
   if (!isnan(h))
     sensorHumid = h;
   else
-    LOG("[SENSOR]   ⚠ Humidity read failed, using previous value");
+    LOG("[SENSOR]    Humidity read failed, using previous value");
 
   // ── Current (ACS712-5A) ─────────────────────────────────────────
   //  Read signed first (needed by SOC engine), then store absolute for server
@@ -486,11 +486,11 @@ void initModem()
   LOG("[MODEM] Initializing...");
   if (!modem.init())
   {
-    LOG("[MODEM] ⚠ init() failed — trying restart()");
+    LOG("[MODEM]  init() failed — trying restart()");
   }
   if (!modem.restart())
   {
-    LOG("[MODEM] ⚠ restart() failed — continuing");
+    LOG("[MODEM]  restart() failed — continuing");
   }
 
   String name = modem.getModemName();
@@ -500,12 +500,12 @@ void initModem()
 
 // Configure modem native TLS
 #if USE_HTTPS
-  // By using TinyGsmClientSecure, we offload the TLS handshake to the 
+  // By using TinyGsmClientSecure, we offload the TLS handshake to the
   // Quectel modem's internal IP stack, which is much more stable over 4G.
   LOG("[MODEM] TLS: using modem's built-in hardware TLS stack");
 #endif
 
-  LOG("[MODEM] ✓ Ready\n");
+  LOG("[MODEM]  Ready\n");
 }
 
 void waitForNetwork()
@@ -514,14 +514,14 @@ void waitForNetwork()
 
   if (!modem.waitForNetwork(NETWORK_TIMEOUT_MS, true))
   {
-    LOG("[NET] ✗ No network! Check SIM / antenna / coverage");
+    LOG("[NET]  No network! Check SIM / antenna / coverage");
     LOG("[NET]   Rebooting in 30s...");
     delay(30000);
     ESP.restart();
   }
 
   int csq = modem.getSignalQuality();
-  LOGF("[NET] ✓ Registered (signal: %d/31)\n", csq);
+  LOGF("[NET]  Registered (signal: %d/31)\n", csq);
 }
 
 void connectGPRS()
@@ -530,17 +530,17 @@ void connectGPRS()
 
   if (!modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS))
   {
-    LOG("[NET] ✗ GPRS failed — retrying in 10s");
+    LOG("[NET]  GPRS failed — retrying in 10s");
     delay(10000);
     if (!modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS))
     {
-      LOG("[NET] ✗ GPRS failed again — rebooting");
+      LOG("[NET]  GPRS failed again — rebooting");
       delay(5000);
       ESP.restart();
     }
   }
 
-  LOG("[NET] ✓ GPRS connected");
+  LOG("[NET]  GPRS connected");
   LOG("[NET]   IP: " + modem.getLocalIP());
 }
 
@@ -548,13 +548,13 @@ void ensureConnected()
 {
   if (!modem.isNetworkConnected())
   {
-    LOG("[NET] ⚠ Network lost — reconnecting");
+    LOG("[NET]  Network lost — reconnecting");
     waitForNetwork();
     connectGPRS();
   }
   if (!modem.isGprsConnected())
   {
-    LOG("[NET] ⚠ GPRS lost — reconnecting");
+    LOG("[NET]  GPRS lost — reconnecting");
     connectGPRS();
   }
 }
@@ -589,15 +589,15 @@ void registerWithRetry()
     if (code == 200 || code == 201)
     {
       registered = true;
-      LOG("[REG] ✓ Registered successfully\n");
+      LOG("[REG]  Registered successfully\n");
       return;
     }
 
-    LOGF("[REG] ✗ Attempt %d failed (HTTP %d)\n", i, code);
+    LOGF("[REG]  Attempt %d failed (HTTP %d)\n", i, code);
     delay(REGISTER_RETRY_MS);
   }
 
-  LOG("[REG] ✗ All attempts failed — will retry in main loop\n");
+  LOG("[REG]  All attempts failed — will retry in main loop\n");
 }
 
 // ── Send sensor data ────────────────────────────────────────────────
@@ -625,11 +625,11 @@ bool sendSensorData()
 
   if (code == 201)
   {
-    LOG("[DATA] ✓ Accepted (201)\n");
+    LOG("[DATA]  Accepted (201)\n");
     return true;
   }
 
-  LOGF("[DATA] ✗ Rejected (HTTP %d)\n", code);
+  LOGF("[DATA]  Rejected (HTTP %d)\n", code);
 
   // 404 = device not found → need to re-register
   if (code == 404)
@@ -662,7 +662,7 @@ int httpPost(const char *path, const String &body,
 
     if (!netClient.connect(SERVER_HOST, SERVER_PORT))
     {
-      LOG("[HTTP] ✗ TCP connect failed");
+      LOG("[HTTP]  TCP connect failed");
       netClient.stop();
       continue;
     }
@@ -693,7 +693,7 @@ int httpPost(const char *path, const String &body,
 
     if (!netClient.available())
     {
-      LOG("[HTTP] ✗ Response timeout");
+      LOG("[HTTP]  Response timeout");
       netClient.stop();
       continue;
     }
@@ -722,7 +722,8 @@ int httpPost(const char *path, const String &body,
     while (netClient.available() && millis() - readStart < 3000)
     {
       char c = netClient.read();
-      if (respIndex < (sizeof(respBuffer) - 1)) {
+      if (respIndex < (sizeof(respBuffer) - 1))
+      {
         respBuffer[respIndex++] = c;
       }
     }
@@ -747,7 +748,7 @@ int httpPost(const char *path, const String &body,
     }
   }
 
-  LOG("[HTTP] ✗ All retries failed");
+  LOG("[HTTP]  All retries failed");
   return -1;
 }
 

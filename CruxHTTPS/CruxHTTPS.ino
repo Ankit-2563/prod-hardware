@@ -178,7 +178,7 @@ void initSensors()
   pinMode(ZMPT101B_PIN, INPUT);
   LOGF("[SENSOR]   ZMPT101B on GPIO %d\n", ZMPT101B_PIN);
 
-  LOG("[SENSOR] ✓ Ready\n");
+  LOG("[SENSOR]  Ready\n");
 }
 
 void readAllSensors()
@@ -216,7 +216,7 @@ void readAllSensors()
   }
   else
   {
-    LOG("[SENSOR]   ⚠ ALL temp sensors failed — using previous value");
+    LOG("[SENSOR]    ALL temp sensors failed — using previous value");
   }
 
   // ── Humidity: from sensor #0 (DHT11 on GPIO 4) only ───────────
@@ -225,7 +225,7 @@ void readAllSensors()
   if (!isnan(h))
     sensorHumid = h;
   else
-    LOG("[SENSOR]   ⚠ Humidity read failed, using previous value");
+    LOG("[SENSOR]    Humidity read failed, using previous value");
 
   // ── Current (ACS712-5A) ─────────────────────────────────────────
   //  Read signed first (needed by SOC engine), then store absolute for server
@@ -462,11 +462,11 @@ void initModem()
   LOG("[MODEM] Initializing...");
   if (!modem.init())
   {
-    LOG("[MODEM] ⚠ init() failed — trying restart()");
+    LOG("[MODEM]  init() failed — trying restart()");
   }
   if (!modem.restart())
   {
-    LOG("[MODEM] ⚠ restart() failed — continuing");
+    LOG("[MODEM]  restart() failed — continuing");
   }
 
   String name = modem.getModemName();
@@ -476,12 +476,12 @@ void initModem()
 
 // Configure modem native TLS
 #if USE_HTTPS
-  // By using TinyGsmClientSecure, we offload the TLS handshake to the 
+  // By using TinyGsmClientSecure, we offload the TLS handshake to the
   // Quectel modem's internal IP stack, which is much more stable over 4G.
   LOG("[MODEM] TLS: using modem's built-in hardware TLS stack");
 #endif
 
-  LOG("[MODEM] ✓ Ready\n");
+  LOG("[MODEM]  Ready\n");
 }
 
 void waitForNetwork()
@@ -490,14 +490,14 @@ void waitForNetwork()
 
   if (!modem.waitForNetwork(NETWORK_TIMEOUT_MS, true))
   {
-    LOG("[NET] ✗ No network! Check SIM / antenna / coverage");
+    LOG("[NET]  No network! Check SIM / antenna / coverage");
     LOG("[NET]   Rebooting in 30s...");
     delay(30000);
     ESP.restart();
   }
 
   int csq = modem.getSignalQuality();
-  LOGF("[NET] ✓ Registered (signal: %d/31)\n", csq);
+  LOGF("[NET]  Registered (signal: %d/31)\n", csq);
 }
 
 void connectGPRS()
@@ -506,17 +506,17 @@ void connectGPRS()
 
   if (!modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS))
   {
-    LOG("[NET] ✗ GPRS failed — retrying in 10s");
+    LOG("[NET]  GPRS failed — retrying in 10s");
     delay(10000);
     if (!modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS))
     {
-      LOG("[NET] ✗ GPRS failed again — rebooting");
+      LOG("[NET]  GPRS failed again — rebooting");
       delay(5000);
       ESP.restart();
     }
   }
 
-  LOG("[NET] ✓ GPRS connected");
+  LOG("[NET]  GPRS connected");
   LOG("[NET]   IP: " + modem.getLocalIP());
 }
 
@@ -524,13 +524,13 @@ void ensureConnected()
 {
   if (!modem.isNetworkConnected())
   {
-    LOG("[NET] ⚠ Network lost — reconnecting");
+    LOG("[NET]  Network lost — reconnecting");
     waitForNetwork();
     connectGPRS();
   }
   if (!modem.isGprsConnected())
   {
-    LOG("[NET] ⚠ GPRS lost — reconnecting");
+    LOG("[NET]  GPRS lost — reconnecting");
     connectGPRS();
   }
 }
@@ -565,15 +565,15 @@ void registerWithRetry()
     if (code == 200 || code == 201)
     {
       registered = true;
-      LOG("[REG] ✓ Registered successfully\n");
+      LOG("[REG]  Registered successfully\n");
       return;
     }
 
-    LOGF("[REG] ✗ Attempt %d failed (HTTP %d)\n", i, code);
+    LOGF("[REG]  Attempt %d failed (HTTP %d)\n", i, code);
     delay(REGISTER_RETRY_MS);
   }
 
-  LOG("[REG] ✗ All attempts failed — will retry in main loop\n");
+  LOG("[REG]  All attempts failed — will retry in main loop\n");
 }
 
 // ── Send sensor data ────────────────────────────────────────────────
@@ -601,11 +601,11 @@ bool sendSensorData()
 
   if (code == 201)
   {
-    LOG("[DATA] ✓ Accepted (201)\n");
+    LOG("[DATA]  Accepted (201)\n");
     return true;
   }
 
-  LOGF("[DATA] ✗ Rejected (HTTP %d)\n", code);
+  LOGF("[DATA]  Rejected (HTTP %d)\n", code);
 
   // 404 = device not found → need to re-register
   if (code == 404)
@@ -669,7 +669,7 @@ int httpPost(const char *path, const String &body,
 
     if (!netClient.available())
     {
-      LOG("[HTTP] ✗ Response timeout");
+      LOG("[HTTP]  Response timeout");
       netClient.stop();
       continue;
     }
@@ -718,7 +718,7 @@ int httpPost(const char *path, const String &body,
     }
   }
 
-  LOG("[HTTP] ✗ All retries failed");
+  LOG("[HTTP]  All retries failed");
   return -1;
 }
 
