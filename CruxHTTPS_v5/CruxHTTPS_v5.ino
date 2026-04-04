@@ -2,16 +2,16 @@
 //  CruxHTTPS_v5.ino — Battery Monitor  (Serial-only, no server)
 // ─────────────────────────────────────────────────────────────────────
 //  Board     : VVM601 (ESP32-S3)  — same pin-out as v4
-//  Sensors   : 4 × DHT (temp/humidity), INA219 (current + voltage)
+//  Sensors   : 4 x DHT (temp/humidity), INA219 (current + voltage)
 //  Battery   : 11.1 V / 8 Ah  18650 3S  w/ BMS
-//              Full: 12.6 V  ·  Cutoff: 9.0 V
+//              Full: 12.6 V  |  Cutoff: 9.0 V
 //  Supply    : 12 V DC  (charging source)
 //
 //  Purpose   : Print real-time SOC and charging status to Serial Monitor.
 //              +ve of both LOAD and BATTERY go through the INA219 high-side
 //              shunt so we can measure current direction:
-//                 positive current → charging
-//                 negative current → discharging
+//                 positive current -> charging
+//                 negative current -> discharging
 //
 //  No modem, no Wi-Fi, no HTTP — purely serial diagnostics.
 // ═══════════════════════════════════════════════════════════════════════
@@ -22,7 +22,7 @@
 #include <Wire.h>
 #include <Adafruit_INA219.h>
 
-// ─── Sensor objects ──────────────────────────────────────────────────
+// --- Sensor objects -------------------------------------------------------
 Adafruit_INA219 ina219;
 
 DHT dhtSensors[TEMP_SENSOR_COUNT] = {
@@ -35,7 +35,7 @@ DHT dhtSensors[TEMP_SENSOR_COUNT] = {
 const uint8_t dhtPins[TEMP_SENSOR_COUNT]  = {DHT0_PIN, DHT1_PIN, DHT2_PIN, DHT3_PIN};
 const uint8_t dhtTypes[TEMP_SENSOR_COUNT] = {DHT0_TYPE, DHT1_TYPE, DHT2_TYPE, DHT3_TYPE};
 
-// ─── State ───────────────────────────────────────────────────────────
+// --- State ----------------------------------------------------------------
 enum ChargeState { CHARGING, DISCHARGING, IDLE_FLOAT };
 
 float sensorTemp     = 0.0;
@@ -51,6 +51,9 @@ ChargeState chargeState = IDLE_FLOAT;
 float    socEstimate   = -1.0;
 uint32_t lastCoulombMs = 0;
 
+// Track last valid voltage for glitch rejection
+float lastValidVoltage = 0.0;
+
 uint32_t lastReadMs    = 0;
 uint32_t readCount     = 0;
 uint32_t bootTime      = 0;
@@ -65,20 +68,20 @@ void setup()
     delay(500);
 
     Serial.println();
-    LOG("═══════════════════════════════════════════════════════════");
-    LOG("  Crux Battery Monitor · v5  (Serial-only)");
+    LOG("===========================================================");
+    LOG("  Crux Battery Monitor - v5  (Serial-only)");
     LOG("  Battery  : 11.1V 8000mAh  18650 3S  (BMS)");
     LOG("  Full     : 12.6 V");
     LOG("  Cutoff   : 9.0 V");
     LOG("  Supply   : 12 V DC");
-    LOG("  Sensor   : INA219 (I2C) + 4× DHT");
-    LOG("═══════════════════════════════════════════════════════════");
+    LOG("  Sensor   : INA219 (I2C) + 4x DHT");
+    LOG("===========================================================");
     Serial.println();
 
     initSensors();
 
     bootTime = millis();
-    LOG("[BOOT] Setup complete — entering monitor loop\n");
+    LOG("[BOOT] Setup complete -- entering monitor loop\n");
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -121,7 +124,7 @@ void initSensors()
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     if (!ina219.begin())
     {
-        LOG("[SENSOR]   ⚠ INA219 NOT found — check wiring!");
+        LOG("[SENSOR]   WARNING: INA219 NOT found -- check wiring!");
         LOG("[SENSOR]   SDA=" + String(I2C_SDA_PIN) +
             "  SCL=" + String(I2C_SCL_PIN));
     }
@@ -142,7 +145,7 @@ void initSensors()
 
 void readAllSensors()
 {
-    // ── Temperature ──────────────────────────────────────────────
+    // -- Temperature -------------------------------------------------------
     float tempSum = 0.0;
     int   tempCount = 0;
 
@@ -159,18 +162,36 @@ void readAllSensors()
     if (tempCount > 0)
         sensorTemp = tempSum / tempCount;
 
-    // ── Humidity (from first DHT) ────────────────────────────────
+    // -- Humidity (from first DHT) -----------------------------------------
     float h = dhtSensors[0].readHumidity();
     if (!isnan(h))
         sensorHumid = h;
 
-    // ── INA219 — Current / Voltage / Power ───────────────────────
+    // -- INA219 -- Current / Voltage / Power -------------------------------
     float shuntVoltage_mV = ina219.getShuntVoltage_mV();
     float busVoltage_V    = ina219.getBusVoltage_V();
     float current_mA      = ina219.getCurrent_mA();
 
     // Load voltage = bus voltage + shunt drop
-    sensorVoltage = busVoltage_V + (shuntVoltage_mV / 1000.0);
+    float rawVoltage = busVoltage_V + (shuntVoltage_mV / 1000.0);
+
+    // ---- Voltage validation ----
+    // If voltage is below 3V, it's a garbage reading (loose GND wire, noise).
+    // Ignore it and keep the last valid voltage.
+    if (rawVoltage >= 3.0)
+    {
+        sensorVoltage    = rawVoltage;
+        lastValidVoltage = rawVoltage;
+    }
+    else if (lastValidVoltage > 0)
+    {
+        // Keep last valid reading, don't update
+        sensorVoltage = lastValidVoltage;
+    }
+    else
+    {
+        sensorVoltage = rawVoltage;  // no valid reading yet, use what we have
+    }
 
     // Signed current:  positive = charging, negative = discharging
     float signedCurrent_A = (current_mA / 1000.0) * CHARGE_DIRECTION;
@@ -179,7 +200,7 @@ void readAllSensors()
     // Power
     sensorPower = ina219.getPower_mW() / 1000.0;
 
-    // ── Charge State ─────────────────────────────────────────────
+    // -- Charge State ------------------------------------------------------
     if (signedCurrent_A > CHARGE_CURRENT_THRESH_A)
         chargeState = CHARGING;
     else if (signedCurrent_A < -DISCHARGE_CURRENT_THRESH_A)
@@ -187,22 +208,22 @@ void readAllSensors()
     else
         chargeState = IDLE_FLOAT;
 
-    // ── SOC (Coulomb counting + voltage lookup) ──────────────────
+    // -- SOC (Coulomb counting + voltage lookup) ---------------------------
     sensorSOC = calculateSOC(sensorVoltage, signedCurrent_A, sensorTemp);
 }
 
 // ═════════════════════════════════════════════════════════════════════
-//  SOC CALCULATION  — adapted for 3S 18650 (9.0 – 12.6 V)
+//  SOC CALCULATION  -- adapted for 3S 18650 (9.0 - 12.6 V)
 // ═════════════════════════════════════════════════════════════════════
 
 // Voltage-to-SOC lookup for 3S Li-ion (18650)
-// Based on typical Li-ion discharge curve × 3 cells in series.
-//   Per-cell: 3.00 → 3.30 → 3.50 → 3.60 → 3.70 → 3.75 → 3.80 → 3.85 → 3.95 → 4.10 → 4.20
-//   × 3    :  9.00 → 9.90 → 10.50→ 10.80→ 11.10→ 11.25→ 11.40→ 11.55→ 11.85→ 12.30→ 12.60
+// Based on typical Li-ion discharge curve x 3 cells in series.
+//   Per-cell: 3.00 -> 3.30 -> 3.50 -> 3.60 -> 3.70 -> 3.75 -> 3.80 -> 3.85 -> 3.95 -> 4.10 -> 4.20
+//   x 3    :  9.00 -> 9.90 -> 10.50-> 10.80-> 11.10-> 11.25-> 11.40-> 11.55-> 11.85-> 12.30-> 12.60
 float voltageToSOC(float v)
 {
     static const float LUT_V[] = {
-         9.00,   // 0%   — BMS cutoff
+         9.00,   // 0%   -- BMS cutoff
          9.90,   // 10%
         10.50,   // 20%
         10.80,   // 30%
@@ -212,7 +233,7 @@ float voltageToSOC(float v)
         11.55,   // 70%
         11.85,   // 80%
         12.30,   // 90%
-        12.60    // 100% — fully charged
+        12.60    // 100% -- fully charged
     };
     static const float LUT_SOC[] = {
           0.0,  10.0,  20.0,  30.0,  40.0,
@@ -234,11 +255,11 @@ float voltageToSOC(float v)
     return 100.0;
 }
 
-// Temperature compensation for Li-ion (per cell ~3 mV/°C, × 3 cells)
+// Temperature compensation for Li-ion (per cell ~3 mV per degree C, x 3 cells)
 float temperatureCompensate(float v, float tempC)
 {
     const float CELLS             = (float)CELL_COUNT;
-    const float MV_PER_CELL_PER_C = 0.003;  // 3 mV/°C typical
+    const float MV_PER_CELL_PER_C = 0.003;  // 3 mV per degree C typical
     return v + (25.0 - tempC) * CELLS * MV_PER_CELL_PER_C;
 }
 
@@ -247,16 +268,16 @@ float calculateSOC(float rawVoltage, float signedCurrentA, float tempC)
     float compV      = temperatureCompensate(rawVoltage, tempC);
     float voltageSoc = voltageToSOC(compV);
 
-    // First reading — seed from voltage
+    // First reading -- seed from voltage
     if (socEstimate < 0.0)
     {
         socEstimate   = voltageSoc;
         lastCoulombMs = millis();
-        LOGF("[SOC] ★ Initialized from voltage: %.1f%%\n", socEstimate);
+        LOGF("[SOC] Initialized from voltage: %.1f%%\n", socEstimate);
         return socEstimate;
     }
 
-    // Coulomb counting: ΔSOC = (I × Δt) / Capacity × 100
+    // Coulomb counting: dSOC = (I x dt) / Capacity x 100
     uint32_t nowMs        = millis();
     float    elapsedHours = (nowMs - lastCoulombMs) / 3600000.0;
     lastCoulombMs = nowMs;
@@ -265,10 +286,12 @@ float calculateSOC(float rawVoltage, float signedCurrentA, float tempC)
     socEstimate    += deltaSOC;
     socEstimate     = constrain(socEstimate, 0.0, 100.0);
 
-    // Idle drift correction — blend toward voltage lookup when current ≈ 0
+    // Idle drift correction -- VERY gentle blend toward voltage lookup
+    // Only when current is essentially zero (idle battery).
+    // Using 2% weight (was 20%) to prevent SOC from drifting on noise.
     if (fabs(signedCurrentA) < CHARGE_CURRENT_THRESH_A)
     {
-        socEstimate = 0.80 * socEstimate + 0.20 * voltageSoc;
+        socEstimate = 0.98 * socEstimate + 0.02 * voltageSoc;
     }
 
     return socEstimate;
@@ -282,32 +305,35 @@ const char *chargeStateStr(ChargeState s)
 {
     switch (s)
     {
-        case CHARGING:     return "⚡ CHARGING";
-        case DISCHARGING:  return "🔋 DISCHARGING";
-        case IDLE_FLOAT:   return "🟢 IDLE / FLOAT";
+        case CHARGING:     return "[CHARGING]";
+        case DISCHARGING:  return "[DISCHARGING]";
+        case IDLE_FLOAT:   return "[IDLE / FLOAT]";
     }
-    return "UNKNOWN";
+    return "[UNKNOWN]";
 }
 
 void printDashboard()
 {
     uint32_t uptimeSec = (millis() - bootTime) / 1000;
 
-    Serial.println();
-    Serial.println("┌──────────────────────────────────────────────┐");
-    Serial.println("│          CRUX BATTERY MONITOR  v5            │");
-    Serial.println("├──────────────────────────────────────────────┤");
+    // Clear screen - keeps only latest reading visible in Serial Monitor
+    // Works with PuTTY, screen, minicom. Arduino IDE will just show latest at bottom.
+    Serial.print("\033[2J\033[H");
 
-    LOGF("│  Reading #%-6lu       Uptime: %02lu:%02lu:%02lu    │\n",
+    Serial.println("+----------------------------------------------+");
+    Serial.println("|          CRUX BATTERY MONITOR  v5            |");
+    Serial.println("+----------------------------------------------+");
+
+    LOGF("|  Reading #%-6lu       Uptime: %02lu:%02lu:%02lu    |\n",
          readCount,
          uptimeSec / 3600, (uptimeSec / 60) % 60, uptimeSec % 60);
 
-    Serial.println("├──────────────────────────────────────────────┤");
+    Serial.println("+----------------------------------------------+");
 
-    // ── Charge status ─────────────────────────────────────────
-    LOGF("│  Status  : %-33s│\n", chargeStateStr(chargeState));
+    // -- Charge status -------------------------------------------------
+    LOGF("|  Status  : %-33s|\n", chargeStateStr(chargeState));
 
-    // ── SOC bar ───────────────────────────────────────────────
+    // -- SOC bar -------------------------------------------------------
     int barLen   = 20;
     int filled   = (int)(sensorSOC / 100.0 * barLen);
     if (filled > barLen) filled = barLen;
@@ -317,45 +343,44 @@ void printDashboard()
         bar[i] = (i < filled) ? '#' : '-';
     bar[barLen] = '\0';
 
-    LOGF("│  SOC     : %5.1f %%  [%s]  │\n", sensorSOC, bar);
+    LOGF("|  SOC     : %5.1f %%  [%s]  |\n", sensorSOC, bar);
 
-    Serial.println("├──────────────────────────────────────────────┤");
+    Serial.println("+----------------------------------------------+");
 
-    // ── Electrical readings ───────────────────────────────────
-    LOGF("│  Voltage : %6.2f V                          │\n", sensorVoltage);
-    LOGF("│  Current : %+7.3f A                         │\n", sensorCurrent);
-    LOGF("│  Power   : %6.2f W                          │\n", sensorPower);
+    // -- Electrical readings -------------------------------------------
+    LOGF("|  Voltage : %6.2f V                          |\n", sensorVoltage);
+    LOGF("|  Current : %+7.3f A                         |\n", sensorCurrent);
+    LOGF("|  Power   : %6.2f W                          |\n", sensorPower);
 
     // Per-cell voltage estimate
     float perCell = sensorVoltage / CELL_COUNT;
-    LOGF("│  Per-Cell: %5.2f V  (avg of %dS)              │\n", perCell, CELL_COUNT);
+    LOGF("|  Per-Cell: %5.2f V  (avg of %dS)              |\n", perCell, CELL_COUNT);
 
-    Serial.println("├──────────────────────────────────────────────┤");
+    Serial.println("+----------------------------------------------+");
 
-    // ── Environment ───────────────────────────────────────────
-    LOGF("│  Temp    : %5.1f °C                           │\n", sensorTemp);
-    LOGF("│  Humid   : %5.1f %%                            │\n", sensorHumid);
+    // -- Environment ---------------------------------------------------
+    LOGF("|  Temp    : %5.1f C                            |\n", sensorTemp);
+    LOGF("|  Humid   : %5.1f %%                            |\n", sensorHumid);
 
-    Serial.println("├──────────────────────────────────────────────┤");
+    Serial.println("+----------------------------------------------+");
 
-    // ── Diagnostics ───────────────────────────────────────────
+    // -- Diagnostics ---------------------------------------------------
     if (sensorVoltage > BATTERY_FULL_V + 0.1)
     {
-        Serial.println("│  ⚠ VOLTAGE ABOVE FULL CHARGE — check PSU!   │");
+        Serial.println("|  WARNING: VOLTAGE ABOVE FULL CHARGE         |");
     }
     if (sensorVoltage < BATTERY_EMPTY_V)
     {
-        Serial.println("│  ⚠ VOLTAGE BELOW CUTOFF — BMS may disconnect │");
+        Serial.println("|  WARNING: VOLTAGE BELOW CUTOFF               |");
     }
     if (chargeState == CHARGING && sensorSOC >= 99.5)
     {
-        Serial.println("│  ✓ Battery fully charged — trickle / float   │");
+        Serial.println("|  FULL: Battery fully charged (float)         |");
     }
     if (chargeState == DISCHARGING && sensorSOC < 10.0)
     {
-        Serial.println("│  ⚠ LOW BATTERY — consider connecting charger │");
+        Serial.println("|  LOW BATTERY: Connect charger                |");
     }
 
-    Serial.println("└──────────────────────────────────────────────┘");
-    Serial.println();
+    Serial.println("+----------------------------------------------+");
 }

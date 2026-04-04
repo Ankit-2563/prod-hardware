@@ -51,7 +51,7 @@
 
 // Current direction: +1 → charging current is positive from INA219
 //                    -1 → charging current is negative (reverse wiring)
-#define CHARGE_DIRECTION          1
+#define CHARGE_DIRECTION         -1
 
 // ─────────────────────────────────────────────────────────────────
 //  CHARGING SUPPLY
