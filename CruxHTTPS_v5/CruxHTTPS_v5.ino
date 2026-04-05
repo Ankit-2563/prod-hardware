@@ -205,8 +205,8 @@ void readAllSensors()
     float busVoltage_V    = ina219.getBusVoltage_V();
     float current_mA      = ina219.getCurrent_mA();
 
-    // Load voltage = bus voltage + shunt drop
-    float rawVoltage = busVoltage_V + (shuntVoltage_mV / 1000.0);
+    // Load voltage = bus voltage + shunt drop + offset
+    float rawVoltage = busVoltage_V + (shuntVoltage_mV / 1000.0) + VOLTAGE_CALIBRATION_OFFSET;
 
     // ---- Voltage validation ----
     // If voltage is below 3V, it's a garbage reading (loose GND wire, noise).
@@ -386,7 +386,7 @@ void printDashboard()
 
     // -- Electrical readings -------------------------------------------
     LOGF("|  Voltage : %6.2f V                          |\n", sensorVoltage);
-    LOGF("|  Current : %+7.3f A                         |\n", sensorCurrent);
+    LOGF("|  Current : %7.3f A                         |\n", fabs(sensorCurrent));
     LOGF("|  Power   : %6.2f W                          |\n", sensorPower);
 
     // Per-cell voltage estimate
