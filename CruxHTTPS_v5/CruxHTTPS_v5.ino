@@ -122,6 +122,21 @@ void initSensors()
 
     // INA219 on I2C
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+    // ── I2C bus scan (diagnostic) ──
+    LOG("[I2C] Scanning bus...");
+    int devicesFound = 0;
+    for (uint8_t addr = 1; addr < 127; addr++)
+    {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0)
+        {
+            LOGF("[I2C]   Device found at 0x%02X\n", addr);
+            devicesFound++;
+        }
+    }
+    LOGF("[I2C]   Total devices: %d\n", devicesFound);
+
     if (!ina219.begin())
     {
         LOG("[SENSOR]   WARNING: INA219 NOT found -- check wiring!");
@@ -134,6 +149,24 @@ void initSensors()
         // This covers the 12.6V battery and typical charge/discharge currents
         ina219.setCalibration_32V_2A();
         LOG("[SENSOR]   INA219 ready  (32V / 2A range)");
+
+        // ── Raw INA219 diagnostic dump ──
+        delay(100);  // let first conversion complete
+        float shunt_mV = ina219.getShuntVoltage_mV();
+        float bus_V    = ina219.getBusVoltage_V();
+        float cur_mA   = ina219.getCurrent_mA();
+        float pwr_mW   = ina219.getPower_mW();
+        LOG("[DIAG] ── INA219 Raw Readings ──");
+        LOGF("[DIAG]   Shunt Voltage : %+.4f mV\n", shunt_mV);
+        LOGF("[DIAG]   Bus Voltage   : %.4f V\n",   bus_V);
+        LOGF("[DIAG]   Current       : %+.3f mA\n", cur_mA);
+        LOGF("[DIAG]   Power         : %.3f mW\n",  pwr_mW);
+        LOGF("[DIAG]   Load Voltage  : %.4f V  (bus + shunt)\n", bus_V + shunt_mV / 1000.0);
+        if (bus_V < 1.0)
+            LOG("[DIAG]   ⚠ Bus voltage near 0 — VIN-/GND wiring suspect");
+        if (fabs(cur_mA) > 3100.0)
+            LOG("[DIAG]   ⚠ Current at overflow — shunt resistor / VIN+/VIN- wiring suspect");
+        LOG("[DIAG] ────────────────────────");
     }
 
     LOG("[SENSOR] Init complete\n");
