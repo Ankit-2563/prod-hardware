@@ -53,8 +53,8 @@
 //                    -1 → charging current is negative (reverse wiring)
 #define CHARGE_DIRECTION          1
 
-// Voltage offset to match multimeters due to tiny wire resistance or ADC tolerances 
-#define VOLTAGE_CALIBRATION_OFFSET 0.17 
+// Voltage offset permanently kept at 0.0 to prevent artificial SOC inflation.
+#define VOLTAGE_CALIBRATION_OFFSET 0.0
 
 // ─────────────────────────────────────────────────────────────────
 //  CHARGING SUPPLY
