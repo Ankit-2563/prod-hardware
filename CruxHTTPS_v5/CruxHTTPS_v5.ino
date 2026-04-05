@@ -304,6 +304,10 @@ float calculateSOC(float rawVoltage, float signedCurrentA, float tempC)
     // First reading -- seed from voltage
     if (socEstimate < 0.0)
     {
+        if (rawVoltage < 3.0) {
+            return 0.0; // Wait for a valid battery connection before seeding
+        }
+        
         socEstimate   = voltageSoc;
         lastCoulombMs = millis();
         LOGF("[SOC] Initialized from voltage: %.1f%%\n", socEstimate);
