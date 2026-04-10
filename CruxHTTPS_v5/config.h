@@ -20,7 +20,7 @@
 // ─────────────────────────────────────────────────────────────────
 //  DHT TEMPERATURE + HUMIDITY SENSORS  (same GPIOs as v4)
 // ─────────────────────────────────────────────────────────────────
-#define TEMP_SENSOR_COUNT 4
+#define TEMP_SENSOR_COUNT 3
 
 #define DHT0_PIN  4
 #define DHT0_TYPE 22
@@ -30,9 +30,6 @@
 
 #define DHT2_PIN  16
 #define DHT2_TYPE 22
-
-#define DHT3_PIN  17
-#define DHT3_TYPE 11
 
 // ─────────────────────────────────────────────────────────────────
 //  I2C  (INA219 current / voltage sensor)

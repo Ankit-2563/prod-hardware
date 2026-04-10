@@ -23,7 +23,7 @@
 #define GPRS_USER ""
 #define GPRS_PASS ""
 
-#define TEMP_SENSOR_COUNT 4
+#define TEMP_SENSOR_COUNT 3
 
 #define DHT0_PIN 4
 #define DHT0_TYPE 22
@@ -33,9 +33,6 @@
 
 #define DHT2_PIN 16
 #define DHT2_TYPE 22
-
-#define DHT3_PIN 17
-#define DHT3_TYPE 11
 
 #define I2C_SDA_PIN 8
 #define I2C_SCL_PIN 9

@@ -29,11 +29,10 @@ DHT dhtSensors[TEMP_SENSOR_COUNT] = {
     DHT(DHT0_PIN, DHT0_TYPE),
     DHT(DHT1_PIN, DHT1_TYPE),
     DHT(DHT2_PIN, DHT2_TYPE),
-    DHT(DHT3_PIN, DHT3_TYPE),
 };
 
-const uint8_t dhtPins[TEMP_SENSOR_COUNT]  = {DHT0_PIN, DHT1_PIN, DHT2_PIN, DHT3_PIN};
-const uint8_t dhtTypes[TEMP_SENSOR_COUNT] = {DHT0_TYPE, DHT1_TYPE, DHT2_TYPE, DHT3_TYPE};
+const uint8_t dhtPins[TEMP_SENSOR_COUNT]  = {DHT0_PIN, DHT1_PIN, DHT2_PIN};
+const uint8_t dhtTypes[TEMP_SENSOR_COUNT] = {DHT0_TYPE, DHT1_TYPE, DHT2_TYPE};
 
 // --- State ----------------------------------------------------------------
 enum ChargeState { CHARGING, DISCHARGING, IDLE_FLOAT };
