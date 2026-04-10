@@ -105,9 +105,9 @@ void setup()
   LOG("  Build  : CruxHTTPS_v3");
   LOG("═══════════════════════════════════════════════\n");
 
+  LOG("═══════════════════════════════════════════════\n");
+
   preferences.begin("crux", false);
-  socEstimate = preferences.getFloat("soc", 100.0);
-  LOGF("[SOC] Loaded from NVS: %.1f%%\n", socEstimate);
 
   initSensors();
   powerOnModem();
@@ -262,7 +262,7 @@ void readAllSensors()
   // Power from INA219 or calculated natively
   sensorPower = ina219.getPower_mW() / 1000.0;
   
-  sensorSOC = calculateSOC(signedCurrent);
+  sensorSOC = calculateSOC(sensorVoltage, signedCurrent, sensorTemp);
 
   LOGF("[SENSOR]   Humid   : %.1f %%\n", sensorHumid);
   LOGF("[SENSOR]   Current : %.3f A\n", sensorCurrent);
@@ -274,17 +274,56 @@ void readAllSensors()
 
 
 
-// ═════════════════════════════════════════════════════════════════════
-//  SOC
-// ═════════════════════════════════════════════════════════════════════
-
-float calculateSOC(float signedCurrentA)
+float voltageToSOC(float v)
 {
+  static const float LUT_V[] = {10.50, 11.31, 11.58, 11.75, 11.90,
+                                12.06, 12.20, 12.32, 12.50, 12.70, 14.40};
+  static const float LUT_SOC[] = {0.0, 10.0, 20.0, 30.0, 40.0,
+                                  50.0, 60.0, 70.0, 80.0, 90.0, 100.0};
+  const int N = 11;
+
+  if (v <= LUT_V[0]) return 0.0;
+  if (v >= LUT_V[N - 1]) return 100.0;
+
+  for (int i = 1; i < N; i++) {
+    if (v <= LUT_V[i]) {
+      float ratio = (v - LUT_V[i - 1]) / (LUT_V[i] - LUT_V[i - 1]);
+      return LUT_SOC[i - 1] + ratio * (LUT_SOC[i] - LUT_SOC[i - 1]);
+    }
+  }
+  return 100.0;
+}
+
+float temperatureCompensate(float v, float tempC)
+{
+  const float CELLS = 6.0;
+  const float MV_PER_CELL_PER_C = 0.003;
+  return v + (25.0 - tempC) * CELLS * MV_PER_CELL_PER_C;
+}
+
+float calculateSOC(float rawVoltage, float signedCurrentA, float tempC)
+{
+  float compV = temperatureCompensate(rawVoltage, tempC);
+  float voltageSoc = voltageToSOC(compV);
+
   uint32_t nowMs = millis();
   
   if (lastCoulombMs == 0) {
     lastCoulombMs = nowMs;
-    // Don't accumulate delta on the very first read
+    float savedSoc = preferences.getFloat("soc", -1.0);
+    
+    if (savedSoc < 0.0) {
+      socEstimate = voltageSoc;
+      LOGF("[SOC] ★ No saved SOC found. Seeded from voltage: %.1f%%\n", socEstimate);
+    } else {
+      if (abs(savedSoc - voltageSoc) > 15.0) {
+        socEstimate = voltageSoc;
+        LOGF("[SOC] ★ Saved SOC (%.1f%%) deviates from Voltage SOC (%.1f%%) by >15%%. Overriding with Voltage SOC.\n", savedSoc, voltageSoc);
+      } else {
+        socEstimate = savedSoc;
+        LOGF("[SOC] ★ Loaded authentic SOC from memory: %.1f%%\n", socEstimate);
+      }
+    }
     return socEstimate;
   }
   
@@ -293,13 +332,26 @@ float calculateSOC(float signedCurrentA)
 
   float deltaSOC = (signedCurrentA * elapsedHours / BATTERY_CAPACITY_AH) * 100.0;
   socEstimate += deltaSOC;
+
+  if (fabs(signedCurrentA) < 0.5)
+  {
+    float before = socEstimate;
+    socEstimate = 0.80 * socEstimate + 0.20 * voltageSoc;
+    LOGF("[SOC] Idle drift correction: %.1f%% → %.1f%%\n", before, socEstimate);
+  }
+
   socEstimate = constrain(socEstimate, 0.0, 100.0);
 
-  // Save the new value to non-volatile flash memory
-  preferences.putFloat("soc", socEstimate);
+  float lastSavedSoc = preferences.getFloat("soc", -1.0);
+  if (abs(socEstimate - lastSavedSoc) >= 1.0) {
+    preferences.putFloat("soc", socEstimate);
+    LOGF("[SOC] Flushed to NVS memory: %.1f%%\n", socEstimate);
+  }
 
-  LOGF("[SOC] I=%+.3fA | Δt=%.4fh | ΔSOC=%+.4f%% | Coulomb→%.2f%%\n",
-       signedCurrentA, elapsedHours, deltaSOC, socEstimate);
+  LOGF("[SOC] V=%.2fV (comp=%.2fV) | T=%.1f°C | I=%+.3fA\n",
+       rawVoltage, compV, tempC, signedCurrentA);
+  LOGF("[SOC] Δt=%.4fh | ΔSOC=%+.3f%% | Coulomb→%.1f%% | VLookup=%.1f%%\n",
+       elapsedHours, deltaSOC, socEstimate, voltageSoc);
 
   return socEstimate;
 }

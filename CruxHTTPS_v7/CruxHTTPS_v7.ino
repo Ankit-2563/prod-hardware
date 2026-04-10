@@ -15,6 +15,9 @@
 
 #include "config.h"
 #include <esp_task_wdt.h>
+#include <RTClib.h>
+
+RTC_DS3231 rtc;
 
 // ── TinyGSM must be configured BEFORE the include ────────────────────
 #define TINY_GSM_MODEM_BG96
@@ -156,17 +159,11 @@ void setup()
   LOG("  Build  : CruxHTTPS_v7 (DS3231 EEPROM)");
   LOG("═══════════════════════════════════════════════\n");
 
-  initSensors();
-
-  // Load SoC from EEPROM
-  byte magic = readByteFromEEPROM(EEPROM_ADDR_MAGIC);
-  if (magic == EEPROM_MAGIC_BYTE) {
-    socEstimate = readFloatFromEEPROM(EEPROM_ADDR_SOC);
-    LOGF("[SOC] Loaded from EEPROM: %.1f%%\n", socEstimate);
-  } else {
-    socEstimate = 100.0;
-    LOG("[SOC] EEPROM empty. Defaulting to 100.0%");
+  if (!rtc.begin()) {
+    LOG("[RTC] ⚠ Couldn't find RTC module!");
   }
+
+  initSensors();
 
   powerOnModem();
   initModem();
@@ -320,7 +317,7 @@ void readAllSensors()
   // Power from INA219 or calculated natively
   sensorPower = ina219.getPower_mW() / 1000.0;
   
-  sensorSOC = calculateSOC(signedCurrent);
+  sensorSOC = calculateSOC(sensorVoltage, signedCurrent, sensorTemp);
 
   LOGF("[SENSOR]   Humid   : %.1f %%\n", sensorHumid);
   LOGF("[SENSOR]   Current : %.3f A\n", sensorCurrent);
@@ -332,32 +329,93 @@ void readAllSensors()
 
 
 
-// ═════════════════════════════════════════════════════════════════════
-//  SOC
-// ═════════════════════════════════════════════════════════════════════
-
-float calculateSOC(float signedCurrentA)
+float voltageToSOC(float v)
 {
-  uint32_t nowMs = millis();
+  static const float LUT_V[] = {10.50, 11.31, 11.58, 11.75, 11.90,
+                                12.06, 12.20, 12.32, 12.50, 12.70, 14.40};
+  static const float LUT_SOC[] = {0.0, 10.0, 20.0, 30.0, 40.0,
+                                  50.0, 60.0, 70.0, 80.0, 90.0, 100.0};
+  const int N = 11;
+
+  if (v <= LUT_V[0]) return 0.0;
+  if (v >= LUT_V[N - 1]) return 100.0;
+
+  for (int i = 1; i < N; i++) {
+    if (v <= LUT_V[i]) {
+      float ratio = (v - LUT_V[i - 1]) / (LUT_V[i] - LUT_V[i - 1]);
+      return LUT_SOC[i - 1] + ratio * (LUT_SOC[i] - LUT_SOC[i - 1]);
+    }
+  }
+  return 100.0;
+}
+
+float temperatureCompensate(float v, float tempC)
+{
+  const float CELLS = 6.0;
+  const float MV_PER_CELL_PER_C = 0.003;
+  return v + (25.0 - tempC) * CELLS * MV_PER_CELL_PER_C;
+}
+
+float calculateSOC(float rawVoltage, float signedCurrentA, float tempC)
+{
+  float compV = temperatureCompensate(rawVoltage, tempC);
+  float voltageSoc = voltageToSOC(compV);
+
+  uint32_t nowEpoch = rtc.now().unixtime();
   
-  if (lastCoulombMs == 0) {
-    lastCoulombMs = nowMs;
+  if (lastCoulombMs == 0 || nowEpoch < lastCoulombMs) {
+    lastCoulombMs = nowEpoch;
+    
+    float savedSoc = -1.0;
+    if (readByteFromEEPROM(EEPROM_ADDR_MAGIC) == EEPROM_MAGIC_BYTE) {
+      savedSoc = readFloatFromEEPROM(EEPROM_ADDR_SOC);
+    }
+    
+    if (savedSoc < 0.0 || savedSoc > 100.0) {
+      socEstimate = voltageSoc;
+      LOGF("[SOC] ★ No saved SOC found in EEPROM. Seeded from voltage: %.1f%%\n", socEstimate);
+    } else {
+      if (abs(savedSoc - voltageSoc) > 15.0) {
+        socEstimate = voltageSoc;
+        LOGF("[SOC] ★ EEPROM SOC (%.1f%%) deviates from Voltage SOC (%.1f%%) by >15%%. Overriding with Voltage SOC.\n", savedSoc, voltageSoc);
+      } else {
+        socEstimate = savedSoc;
+        LOGF("[SOC] ★ Loaded authentic SOC from EEPROM: %.1f%%\n", socEstimate);
+      }
+    }
     return socEstimate;
   }
   
-  float elapsedHours = (nowMs - lastCoulombMs) / 3600000.0;
-  lastCoulombMs = nowMs;
+  float elapsedHours = (nowEpoch - lastCoulombMs) / 3600.0;
+  lastCoulombMs = nowEpoch;
 
   float deltaSOC = (signedCurrentA * elapsedHours / BATTERY_CAPACITY_AH) * 100.0;
   socEstimate += deltaSOC;
+
+  if (fabs(signedCurrentA) < 0.5)
+  {
+    float before = socEstimate;
+    socEstimate = 0.80 * socEstimate + 0.20 * voltageSoc;
+    LOGF("[SOC] Idle drift correction: %.1f%% → %.1f%%\n", before, socEstimate);
+  }
+
   socEstimate = constrain(socEstimate, 0.0, 100.0);
 
-  // Save the new value to EEPROM memory
-  writeByteToEEPROM(EEPROM_ADDR_MAGIC, EEPROM_MAGIC_BYTE);
-  writeFloatToEEPROM(EEPROM_ADDR_SOC, socEstimate);
+  float lastSavedSoc = -1.0;
+  if (readByteFromEEPROM(EEPROM_ADDR_MAGIC) == EEPROM_MAGIC_BYTE) {
+    lastSavedSoc = readFloatFromEEPROM(EEPROM_ADDR_SOC);
+  }
+  
+  if (abs(socEstimate - lastSavedSoc) >= 1.0) {
+    writeByteToEEPROM(EEPROM_ADDR_MAGIC, EEPROM_MAGIC_BYTE);
+    writeFloatToEEPROM(EEPROM_ADDR_SOC, socEstimate);
+    LOGF("[SOC] Flushed to EEPROM: %.1f%%\n", socEstimate);
+  }
 
-  LOGF("[SOC] I=%+.3fA | Δt=%.4fh | ΔSOC=%+.4f%% | Coulomb→%.2f%%\n",
-       signedCurrentA, elapsedHours, deltaSOC, socEstimate);
+  LOGF("[SOC] V=%.2fV (comp=%.2fV) | T=%.1f°C | I=%+.3fA\n",
+       rawVoltage, compV, tempC, signedCurrentA);
+  LOGF("[SOC] Δt=%.4fh (from RTC) | ΔSOC=%+.3f%% | Coulomb→%.1f%% | VLookup=%.1f%%\n",
+       elapsedHours, deltaSOC, socEstimate, voltageSoc);
 
   return socEstimate;
 }
