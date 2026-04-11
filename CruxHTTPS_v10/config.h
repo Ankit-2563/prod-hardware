@@ -21,9 +21,9 @@
 #define GPRS_PASS ""
 
 // ─────────────────────────────────────────────────────────────────
-//  DHT SENSORS (3x DHT22 — DHT11 removed)
+//  DHT SENSORS (3x DHT22, 1x DHT11)
 // ─────────────────────────────────────────────────────────────────
-#define TEMP_SENSOR_COUNT 3
+#define TEMP_SENSOR_COUNT 4
 
 #define DHT0_PIN  4
 #define DHT0_TYPE 22
@@ -33,6 +33,9 @@
 
 #define DHT2_PIN  16
 #define DHT2_TYPE 22
+
+#define DHT3_PIN  17
+#define DHT3_TYPE 11
 
 // ─────────────────────────────────────────────────────────────────
 //  I2C PINS — Two separate buses
