@@ -206,9 +206,13 @@ void readAllSensors()
     sensorSOC = calculateSOC(sensorVoltage, signedCurrent_A);
 
     // ── Output to Serial ─────────────────────────────────────────────
+    const char* currentStr = "idle";
+    if (signedCurrent_A >= SOC_IDLE_CURRENT_THRESH_A) currentStr = "charging";
+    else if (signedCurrent_A <= -SOC_IDLE_CURRENT_THRESH_A) currentStr = "discharging";
+
     LOGF("[SENSOR]   Voltage    : %.2f V\n",  sensorVoltage);
     LOGF("[SENSOR]   Current    : %.3f A (%s)\n",
-         sensorCurrent, signedCurrent_A >= 0 ? "charging" : "discharging");
+         sensorCurrent, currentStr);
     LOGF("[SENSOR]   Power      : %.2f W\n",  sensorPower);
     LOGF("[SENSOR]   SOC        : %.1f %%\n", sensorSOC);
     
