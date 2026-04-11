@@ -28,7 +28,7 @@
 // ─────────────────────────────────────────────────────────────────
 //  SOC TUNING
 // ─────────────────────────────────────────────────────────────────
-#define SOC_IDLE_CURRENT_THRESH_A   0.05f  // Only correct when |I| < 50 mA (was 0.3A)
+#define SOC_IDLE_CURRENT_THRESH_A   0.010f // Only correct when |I| < 10 mA (true rest)
 #define SOC_VOLTAGE_BLEND           0.005f // 0.5%/s blend — 10× slower (was 0.05)
 #define SOC_REBOOT_MAX_DEVIATION    25.0f
 #define NVS_MAX_RESTORE_SECONDS     86400UL

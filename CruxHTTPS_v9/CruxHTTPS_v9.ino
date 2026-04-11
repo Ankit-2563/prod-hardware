@@ -39,6 +39,11 @@ float    lastValidVoltage = 0.0;
 bool rtcAvailable = false;
 bool rtcTimeValid = false;
 
+// Rest-detection state for idle correction
+uint32_t restStartMs   = 0;
+bool     isResting     = false;
+bool     anchorDone    = false;
+
 // ═════════════════════════════════════════════════════════════════════
 //  SETUP / LOOP
 // ═════════════════════════════════════════════════════════════════════
@@ -308,24 +313,57 @@ float calculateSOC(float rawVoltage, float signedCurrentA)
     LOGF("[SOC] ΔSOC=%+.3f%%  Coulomb→%.1f%%  VLookup=%.1f%%\n",
          deltaSOC, socEstimate, voltageSoc);
 
-    // Voltage-LUT blending — only when truly idle; skip during active discharge/charge
+    // ── Rest detection with 5-minute confirmation ────────────────────
+    uint32_t nowMs = millis();
+
     if (fabs(signedCurrentA) < SOC_IDLE_CURRENT_THRESH_A)
     {
-        // Truly idle (<50 mA): gently drift toward resting-voltage SOC
-        float before = socEstimate;
-        socEstimate  = (1.0f - SOC_VOLTAGE_BLEND) * socEstimate
-                       + SOC_VOLTAGE_BLEND * voltageSoc;
-        LOGF("[SOC] Idle correction: %.1f%% → %.1f%%\n", before, socEstimate);
-    }
-    else if (signedCurrentA < -0.05f)
-    {
-        // DISCHARGING: voltage sags below resting — LUT gives falsely low SOC, skip blend
-        LOGF("[SOC] Discharging — Coulomb only (no V-blend)\n");
+        // Current below 10mA — possible rest
+        if (!isResting)
+        {
+            // Just went idle — start timer
+            isResting   = true;
+            restStartMs = nowMs;
+            anchorDone  = false;
+            LOG("[SOC] Rest timer started — waiting 5 min");
+        }
+        else if (!anchorDone && (nowMs - restStartMs >= 300000UL))
+        {
+            // 5 minutes confirmed rest — voltage is now stable
+            // Safe to anchor toward voltage LUT
+            float before = socEstimate;
+            socEstimate  = (0.90f * socEstimate) + (0.10f * voltageSoc);
+            anchorDone   = true;
+            LOGF("[SOC] ★ 5min REST ANCHOR: %.1f%% → %.1f%%"
+                 " (VLookup=%.1f%%)\n",
+                 before, socEstimate, voltageSoc);
+        }
+        else if (!anchorDone)
+        {
+            uint32_t waited = (nowMs - restStartMs) / 1000;
+            LOGF("[SOC] Resting %lus/300s — Coulomb only\n", waited);
+        }
+        else
+        {
+            LOG("[SOC] Idle — Coulomb only");
+        }
     }
     else
     {
-        // CHARGING: voltage is elevated above resting — LUT gives falsely high SOC, skip blend
-        LOGF("[SOC] Charging — Coulomb only (no V-blend)\n");
+        // Active current — discharge or charge
+        if (isResting)
+        {
+            isResting  = false;
+            anchorDone = false;
+            LOG("[SOC] Load detected — rest cancelled");
+        }
+
+        if (signedCurrentA < 0)
+            LOGF("[SOC] Discharging %.3fA — Coulomb only\n",
+                 fabs(signedCurrentA));
+        else
+            LOGF("[SOC] Charging %.3fA — Coulomb only\n",
+                 signedCurrentA);
     }
 
     return socEstimate;
