@@ -12,7 +12,7 @@
 #include <esp_task_wdt.h>
 
 // ── TinyGSM must be configured BEFORE the include ────────────────────
-#define TINY_GSM_MODEM_BG96
+#define TINY_GSM_MODEM_EC200U
 #define TINY_GSM_USE_GPRS true
 #define SerialAT Serial1
 #define SerialMon Serial
@@ -179,9 +179,18 @@ void flushSDBuffer()
         if (parsed < 6) continue;
 
         char body[192];
-        snprintf(body, sizeof(body),
-                 "{\"temperature\":%.1f,\"voltage\":%.2f,\"power\":%.2f,\"current\":%.3f,\"soc\":%.1f,\"recordedAt\":\"%lu\"}",
-                 t, v, p, c, s, ts);
+        if (ts > 0)
+        {
+            snprintf(body, sizeof(body),
+                     "{\"temperature\":%.1f,\"voltage\":%.2f,\"power\":%.2f,\"current\":%.3f,\"soc\":%.1f,\"recordedAt\":%lu}",
+                     t, v, p, c, s, ts);
+        }
+        else
+        {
+            snprintf(body, sizeof(body),
+                     "{\"temperature\":%.1f,\"voltage\":%.2f,\"power\":%.2f,\"current\":%.3f,\"soc\":%.1f}",
+                     t, v, p, c, s);
+        }
 
         int code = httpPost(DATA_PATH, body, strlen(body), DEVICE_ID, DEVICE_SECRET);
         if (code == 201) sent++;
