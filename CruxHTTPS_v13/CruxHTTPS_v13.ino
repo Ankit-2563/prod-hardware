@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════
-//  CruxHTTPS_v11.ino — Crux IoT · v11
+//  CruxHTTPS_v14.ino — Crux IoT · v14
 // ─────────────────────────────────────────────────────────────────────
 //  Combines the best of all versions:
 //    • SOC engine from ChargeSDLogger (Coulomb counting + rest-anchor +
@@ -10,6 +10,15 @@
 //    • SD card fallback logging when SIM absent or 4G unavailable
 //    • Offline flush: on reconnection all unsynced SD rows are posted
 //      to the server before resuming normal 60-second cadence
+//
+//  v14 fixes vs v13:
+//    • sendSensorData() now includes chargeStatus ("charging" |
+//      "discharging" | "idle") matching server batteryDataSchema exactly
+//    • logRowToSD() stores lowercase chargeStatus (server-compatible)
+//      instead of uppercase stateLabel() string
+//    • flushOfflineRows() sends chargeStatus + recordedAt so the server
+//      stores the real historical timestamp, not the flush time
+//    • JSON_DOC_CAPACITY / JSON_SERIAL_BUFFER bumped to fit extra fields
 //
 //  Wiring:
 //    INA219  SDA→8   SCL→9   VCC→5V  GND→GND
@@ -23,7 +32,7 @@
 //
 //  SD CSV columns:
 //    row, timestamp, temperature_C, humidity_pct, voltage_V,
-//    current_A, power_W, soc_pct, state, synced
+//    current_A, power_W, soc_pct, charge_status, synced
 // ═══════════════════════════════════════════════════════════════════════
 
 #include "config.h"
@@ -32,30 +41,30 @@
 // ── TinyGSM must be configured BEFORE the include ────────────────────
 #define TINY_GSM_MODEM_BG96
 #define TINY_GSM_USE_GPRS true
-#define SerialAT  Serial1
+#define SerialAT Serial1
 #define SerialMon Serial
 
 #include <TinyGsmClient.h>
 #include <ArduinoJson.h>
 
 #if !defined(ARDUINOJSON_VERSION_MAJOR) || (ARDUINOJSON_VERSION_MAJOR < 7)
-  #define CRUX_USE_JSONDOC_V6 1
+#define CRUX_USE_JSONDOC_V6 1
 #else
-  #define CRUX_USE_JSONDOC_V6 0
+#define CRUX_USE_JSONDOC_V6 0
 #endif
 
 #ifdef DUMP_AT_COMMANDS
-  #include <StreamDebugger.h>
-  StreamDebugger debugger(SerialAT, SerialMon);
-  TinyGsm modem(debugger);
+#include <StreamDebugger.h>
+StreamDebugger debugger(SerialAT, SerialMon);
+TinyGsm modem(debugger);
 #else
-  TinyGsm modem(SerialAT);
+TinyGsm modem(SerialAT);
 #endif
 
 #if USE_HTTPS
-  TinyGsmClientSecure netClient(modem);
+TinyGsmClientSecure netClient(modem);
 #else
-  TinyGsmClient netClient(modem);
+TinyGsmClient netClient(modem);
 #endif
 
 #include <DHT.h>
@@ -70,8 +79,8 @@
 //  PERIPHERAL OBJECTS
 // ─────────────────────────────────────────────────────────────────────
 Adafruit_INA219 ina219;
-RTC_DS3231      rtc;
-Preferences     prefs;
+RTC_DS3231 rtc;
+Preferences prefs;
 
 DHT dhtSensors[TEMP_SENSOR_COUNT] = {
     DHT(DHT0_PIN, DHT0_TYPE),
@@ -79,77 +88,88 @@ DHT dhtSensors[TEMP_SENSOR_COUNT] = {
     DHT(DHT2_PIN, DHT2_TYPE),
     DHT(DHT3_PIN, DHT3_TYPE),
 };
-const uint8_t dhtPins[TEMP_SENSOR_COUNT]  = { DHT0_PIN, DHT1_PIN, DHT2_PIN, DHT3_PIN };
-const uint8_t dhtTypes[TEMP_SENSOR_COUNT] = { DHT0_TYPE, DHT1_TYPE, DHT2_TYPE, DHT3_TYPE };
+const uint8_t dhtPins[TEMP_SENSOR_COUNT] = {DHT0_PIN, DHT1_PIN, DHT2_PIN, DHT3_PIN};
+const uint8_t dhtTypes[TEMP_SENSOR_COUNT] = {DHT0_TYPE, DHT1_TYPE, DHT2_TYPE, DHT3_TYPE};
 
 // ─────────────────────────────────────────────────────────────────────
 //  RUNTIME FLAGS & COUNTERS
 // ─────────────────────────────────────────────────────────────────────
-bool     rtcAvailable   = false;
-bool     rtcTimeValid   = false;
-bool     sdReady        = false;
-bool     modemReady     = false;
-bool     networkUp      = false;
-bool     registered     = false;
+bool rtcAvailable = false;
+bool rtcTimeValid = false;
+bool sdReady = false;
+bool modemReady = false;
+bool networkUp = false;
+bool registered = false;
 
-uint32_t bootTime       = 0;
-uint32_t lastSendMs     = 0;
+uint32_t bootTime = 0;
+uint32_t lastSendMs = 0;
 uint32_t lastLocalLogMs = 0;
-uint32_t logRowCount    = 0;
-uint32_t successCount   = 0;
-uint32_t failCount      = 0;
+uint32_t logRowCount = 0;
+uint32_t successCount = 0;
+uint32_t failCount = 0;
 
 // ─────────────────────────────────────────────────────────────────────
 //  LIVE SENSOR VALUES (updated each read cycle)
 // ─────────────────────────────────────────────────────────────────────
-float sensorTemp    = 0.0f;
-float sensorHumid   = 0.0f;
+float sensorTemp = 0.0f;
+float sensorHumid = 0.0f;
 float sensorVoltage = 0.0f;
-float sensorCurrent = 0.0f;   // always positive (magnitude)
-float sensorPower   = 0.0f;
-float sensorSOC     = 0.0f;
-float signedCurrentA = 0.0f;  // sign = charging direction
+float sensorCurrent = 0.0f; // always positive (magnitude)
+float sensorPower = 0.0f;
+float sensorSOC = 0.0f;
+float signedCurrentA = 0.0f; // sign = charging direction
 
 // ─────────────────────────────────────────────────────────────────────
 //  SOC ENGINE STATE  (identical to ChargeSDLogger)
 // ─────────────────────────────────────────────────────────────────────
-float    socEstimate      = -1.0f;
-uint32_t lastCoulombUnix  = 0;
-uint32_t lastCoulombMs    = 0;
-float    lastValidVoltage = 0.0f;
+float socEstimate = -1.0f;
+uint32_t lastCoulombUnix = 0;
+uint32_t lastCoulombMs = 0;
+float lastValidVoltage = 0.0f;
 
 // Rest-detection
 uint32_t restStartMs = 0;
-bool     isResting   = false;
-bool     anchorDone  = false;
+bool isResting = false;
+bool anchorDone = false;
 
 // ─────────────────────────────────────────────────────────────────────
 //  CHARGE STATE ENUM
 // ─────────────────────────────────────────────────────────────────────
-typedef enum { STATE_IDLE, STATE_CHARGING, STATE_DISCHARGING } ChargeState;
+typedef enum
+{
+    STATE_IDLE,
+    STATE_CHARGING,
+    STATE_DISCHARGING
+} ChargeState;
 ChargeState prevState = STATE_IDLE;
 
 const char *stateLabel(ChargeState s)
 {
-    switch (s) {
-        case STATE_CHARGING:    return "CHARGING";
-        case STATE_DISCHARGING: return "DISCHARGING";
-        default:                return "IDLE";
+    switch (s)
+    {
+    case STATE_CHARGING:
+        return "CHARGING";
+    case STATE_DISCHARGING:
+        return "DISCHARGING";
+    default:
+        return "IDLE";
     }
 }
 ChargeState currentToState(float a)
 {
-    if (a >=  IDLE_THRESHOLD_A) return STATE_CHARGING;
-    if (a <= -IDLE_THRESHOLD_A) return STATE_DISCHARGING;
+    if (a >= IDLE_THRESHOLD_A)
+        return STATE_CHARGING;
+    if (a <= -IDLE_THRESHOLD_A)
+        return STATE_DISCHARGING;
     return STATE_IDLE;
 }
 
 // ─────────────────────────────────────────────────────────────────────
 //  FORWARD DECLARATIONS
 // ─────────────────────────────────────────────────────────────────────
-static int  httpPost(const char *path, const char *body, size_t bodyLen,
-                     const char *devId, const char *devSecret);
-void        flushOfflineRows();
+static int httpPost(const char *path, const char *body, size_t bodyLen,
+                    const char *devId, const char *devSecret);
+void flushOfflineRows();
 
 // ═════════════════════════════════════════════════════════════════════
 //  SETUP
@@ -166,7 +186,7 @@ void setup()
     LOG("  ID     : " DEVICE_ID);
     LOG("  Server : " SERVER_HOST);
     LOGF("  Mode   : %s (port %d)\n", USE_HTTPS ? "HTTPS" : "HTTP", SERVER_PORT);
-    LOG("  Build  : CruxHTTPS_v11 (SD offline + ChargeSDLogger SOC)");
+    LOG("  Build  : CruxHTTPS_v14 (SD offline + chargeStatus + recordedAt backfill)");
     LOG("═══════════════════════════════════════════════════════\n");
 
     initPeripherals();
@@ -174,23 +194,27 @@ void setup()
 
     // ── Try to bring modem/network up (non-fatal) ─────────────────────
     modemReady = tryInitModem();
-    if (modemReady) {
+    if (modemReady)
+    {
         networkUp = tryConnectNetwork();
-        if (networkUp) registerWithRetry();
-    } else {
+        if (networkUp)
+            registerWithRetry();
+    }
+    else
+    {
         LOG("[BOOT] No modem — offline SD-only mode");
     }
 
-    bootTime        = millis();
-    lastLocalLogMs  = millis() - LOCAL_LOG_INTERVAL_MS;  // log immediately on boot
-    lastSendMs      = millis() - SEND_INTERVAL_MS;
+    bootTime = millis();
+    lastLocalLogMs = millis() - LOCAL_LOG_INTERVAL_MS; // log immediately on boot
+    lastSendMs = millis() - SEND_INTERVAL_MS;
 
     // ── Watchdog ─────────────────────────────────────────────────────
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
     esp_task_wdt_config_t wdt_cfg = {
-        .timeout_ms     = WDT_TIMEOUT_SECONDS * 1000,
+        .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
         .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
-        .trigger_panic  = true};
+        .trigger_panic = true};
     esp_task_wdt_init(&wdt_cfg);
     esp_task_wdt_add(NULL);
 #else
@@ -214,33 +238,44 @@ void loop()
     saveSOCToNVS();
 
     // ── Local SD log every LOCAL_LOG_INTERVAL_MS (default 60 s) ──────
-    if (now - lastLocalLogMs >= LOCAL_LOG_INTERVAL_MS) {
+    if (now - lastLocalLogMs >= LOCAL_LOG_INTERVAL_MS)
+    {
         lastLocalLogMs = now;
         logRowToSD();
     }
 
     // ── Network path ─────────────────────────────────────────────────
-    if (modemReady) {
+    if (modemReady)
+    {
         // Re-check / re-establish connection
-        if (!networkUp) {
+        if (!networkUp)
+        {
             networkUp = tryConnectNetwork();
-            if (networkUp && !registered) registerWithRetry();
-        } else {
+            if (networkUp && !registered)
+                registerWithRetry();
+        }
+        else
+        {
             ensureConnected();
-            if (!registered) registerWithRetry();
+            if (!registered)
+                registerWithRetry();
         }
 
         // If we just got online, flush any offline SD rows first
-        if (networkUp && registered) {
+        if (networkUp && registered)
+        {
             flushOfflineRows();
         }
 
         // Normal 60-second server push
-        if (networkUp && registered && (now - lastSendMs >= SEND_INTERVAL_MS)) {
+        if (networkUp && registered && (now - lastSendMs >= SEND_INTERVAL_MS))
+        {
             lastSendMs = now;
             bool ok = sendSensorData();
-            if (ok) successCount++;
-            else    failCount++;
+            if (ok)
+                successCount++;
+            else
+                failCount++;
             uint32_t upSec = (millis() - bootTime) / 1000;
             LOGF("[STATS] Uptime: %lum %lus | Sent: %lu ok, %lu fail\n",
                  upSec / 60, upSec % 60, successCount, failCount);
@@ -260,7 +295,8 @@ void initPeripherals()
     LOG("[INIT] Initializing peripherals...");
 
     // ── DHT temperature sensors ───────────────────────────────────────
-    for (int i = 0; i < TEMP_SENSOR_COUNT; i++) {
+    for (int i = 0; i < TEMP_SENSOR_COUNT; i++)
+    {
         dhtSensors[i].begin();
         LOGF("[INIT]   DHT%d on GPIO %d  (sensor #%d)\n", dhtTypes[i], dhtPins[i], i);
     }
@@ -268,13 +304,18 @@ void initPeripherals()
     // ── INA219 on Wire (SDA 8, SCL 9) ────────────────────────────────
     Wire.begin(I2C_INA_SDA_PIN, I2C_INA_SCL_PIN);
     LOG("[I2C] Scanning INA bus (Wire):");
-    for (uint8_t addr = 1; addr < 127; addr++) {
+    for (uint8_t addr = 1; addr < 127; addr++)
+    {
         Wire.beginTransmission(addr);
-        if (Wire.endTransmission() == 0) LOGF("[I2C]   0x%02X\n", addr);
+        if (Wire.endTransmission() == 0)
+            LOGF("[I2C]   0x%02X\n", addr);
     }
-    if (!ina219.begin(&Wire)) {
+    if (!ina219.begin(&Wire))
+    {
         LOG("[WARN] INA219 not found on SDA 8 / SCL 9");
-    } else {
+    }
+    else
+    {
         ina219.setCalibration_32V_2A();
         LOG("[OK] INA219 ready");
     }
@@ -282,20 +323,26 @@ void initPeripherals()
     // ── DS3231 on Wire1 (SDA 14, SCL 21) ─────────────────────────────
     Wire1.begin(I2C_RTC_SDA_PIN, I2C_RTC_SCL_PIN);
     LOG("[I2C] Scanning RTC bus (Wire1):");
-    for (uint8_t addr = 1; addr < 127; addr++) {
+    for (uint8_t addr = 1; addr < 127; addr++)
+    {
         Wire1.beginTransmission(addr);
-        if (Wire1.endTransmission() == 0) LOGF("[I2C]   0x%02X\n", addr);
+        if (Wire1.endTransmission() == 0)
+            LOGF("[I2C]   0x%02X\n", addr);
     }
-    if (!rtc.begin(&Wire1)) {
+    if (!rtc.begin(&Wire1))
+    {
         LOG("[WARN] DS3231 not found — millis() fallback for Δt & timestamps");
         rtcAvailable = false;
-    } else {
+    }
+    else
+    {
         rtcAvailable = true;
-        if (rtc.lostPower()) {
+        if (rtc.lostPower())
+        {
             LOG("[RTC] Lost power — setting to compile time");
             rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
         }
-        DateTime t   = rtc.now();
+        DateTime t = rtc.now();
         rtcTimeValid = (t.year() >= 2024);
         LOGF("[OK] DS3231 ready — %04d-%02d-%02d %02d:%02d:%02d (valid: %s)\n",
              t.year(), t.month(), t.day(),
@@ -305,10 +352,13 @@ void initPeripherals()
 
     // ── SD Card (SPI: MOSI 11, MISO 13, SCK 12, CS 10) ───────────────
     SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-    if (!SD.begin(SD_CS_PIN)) {
+    if (!SD.begin(SD_CS_PIN))
+    {
         LOG("[WARN] SD card not found — local CSV logging disabled");
         sdReady = false;
-    } else {
+    }
+    else
+    {
         sdReady = true;
         uint64_t cardMB = SD.cardSize() / (1024ULL * 1024ULL);
         LOGF("[OK] SD ready — Card size: %llu MB\n", cardMB);
@@ -316,12 +366,16 @@ void initPeripherals()
 
         // Count existing rows so row numbering survives reboot
         File f = SD.open(LOG_FILE, FILE_READ);
-        if (f) {
-            while (f.available()) {
-                if (f.read() == '\n') logRowCount++;
+        if (f)
+        {
+            while (f.available())
+            {
+                if (f.read() == '\n')
+                    logRowCount++;
             }
             f.close();
-            if (logRowCount > 0) logRowCount--;  // subtract header line
+            if (logRowCount > 0)
+                logRowCount--; // subtract header line
             LOGF("[SD] Existing log rows: %lu\n", logRowCount);
         }
     }
@@ -336,59 +390,75 @@ void initPeripherals()
 void readAllSensors()
 {
     // ── DHT (temperature average) ─────────────────────────────────────
-    float tempSum   = 0.0f;
-    int   tempCount = 0;
+    float tempSum = 0.0f;
+    int tempCount = 0;
 
-    for (int i = 0; i < TEMP_SENSOR_COUNT; i++) {
+    for (int i = 0; i < TEMP_SENSOR_COUNT; i++)
+    {
         float t = dhtSensors[i].readTemperature();
-        if (!isnan(t)) {
+        if (!isnan(t))
+        {
             tempSum += t;
             tempCount++;
-        } else {
+        }
+        else
+        {
             LOGF("[SENSOR] DHT%d (GPIO %d) read failed — skipped\n", dhtTypes[i], dhtPins[i]);
         }
-        if ((i & 1) == 1) esp_task_wdt_reset();
+        if ((i & 1) == 1)
+            esp_task_wdt_reset();
     }
 
-    if (tempCount > 0) {
+    if (tempCount > 0)
+    {
         sensorTemp = tempSum / (float)tempCount;
-    } else {
+    }
+    else
+    {
         LOG("[SENSOR] ALL temp sensors failed — soft-reset DHT drivers");
-        for (int i = 0; i < TEMP_SENSOR_COUNT; i++) dhtSensors[i].begin();
+        for (int i = 0; i < TEMP_SENSOR_COUNT; i++)
+            dhtSensors[i].begin();
     }
 
     float h = dhtSensors[0].readHumidity();
-    if (!isnan(h)) sensorHumid = h;
+    if (!isnan(h))
+        sensorHumid = h;
 
     esp_task_wdt_reset();
 
     // ── INA219 (voltage, current, power) ─────────────────────────────
-    float shunt_mV   = ina219.getShuntVoltage_mV();
-    float bus_V      = ina219.getBusVoltage_V();
+    float shunt_mV = ina219.getShuntVoltage_mV();
+    float bus_V = ina219.getBusVoltage_V();
     float current_mA = ina219.getCurrent_mA();
     float rawVoltage = bus_V + (shunt_mV / 1000.0f);
 
     // Voltage glitch filter
-    if (rawVoltage >= 3.0f) {
-        sensorVoltage    = rawVoltage;
+    if (rawVoltage >= 3.0f)
+    {
+        sensorVoltage = rawVoltage;
         lastValidVoltage = rawVoltage;
-    } else if (lastValidVoltage > 0.0f) {
+    }
+    else if (lastValidVoltage > 0.0f)
+    {
         sensorVoltage = lastValidVoltage;
         LOG("[SENSOR] Voltage glitch — using last valid");
-    } else {
+    }
+    else
+    {
         sensorVoltage = rawVoltage;
     }
 
     // Apply wiring direction: positive signedA = charging
     signedCurrentA = (current_mA / 1000.0f) * (float)ACS712_CHARGE_DIRECTION;
-    sensorCurrent  = fabs(signedCurrentA);
-    sensorPower    = ina219.getPower_mW() / 1000.0f;
+    sensorCurrent = fabs(signedCurrentA);
+    sensorPower = ina219.getPower_mW() / 1000.0f;
 
     // ── SOC ───────────────────────────────────────────────────────────
     sensorSOC = calculateSOC(sensorVoltage, signedCurrentA);
 
     ChargeState state = currentToState(signedCurrentA);
-    if (state != prevState) {
+    if (state != prevState)
+    {
         LOGF("[STATUS] %s → %s\n", stateLabel(prevState), stateLabel(state));
         prevState = state;
     }
@@ -398,7 +468,8 @@ void readAllSensors()
          signedCurrentA, sensorPower, sensorSOC,
          stateLabel(state));
 
-    if (rtcAvailable && rtcTimeValid) {
+    if (rtcAvailable && rtcTimeValid)
+    {
         DateTime t = rtc.now();
         LOGF("[RTC] %04d-%02d-%02d %02d:%02d:%02d\n",
              t.year(), t.month(), t.day(), t.hour(), t.minute(), t.second());
@@ -415,18 +486,22 @@ float voltageToSOC(float v, float currentA)
     float restingV = v + fabs(currentA) * IR_OHM;
 
     // 3S Li-ion (18650) resting voltage → SOC lookup table
-    static const float LUT_V[]   = { 9.00f,  9.90f, 10.65f, 10.95f, 11.10f,
-                                    11.25f, 11.40f, 11.55f, 11.70f, 12.00f, 12.60f };
-    static const float LUT_SOC[] = {  0.0f,  10.0f,  20.0f,  30.0f,  40.0f,
-                                     50.0f,  60.0f,  70.0f,  80.0f,  90.0f, 100.0f };
+    static const float LUT_V[] = {9.00f, 9.90f, 10.65f, 10.95f, 11.10f,
+                                  11.25f, 11.40f, 11.55f, 11.70f, 12.00f, 12.60f};
+    static const float LUT_SOC[] = {0.0f, 10.0f, 20.0f, 30.0f, 40.0f,
+                                    50.0f, 60.0f, 70.0f, 80.0f, 90.0f, 100.0f};
     const int N = 11;
 
-    if (restingV <= LUT_V[0])    return 0.0f;
-    if (restingV >= LUT_V[N-1]) return 100.0f;
-    for (int i = 1; i < N; i++) {
-        if (restingV <= LUT_V[i]) {
-            float ratio = (restingV - LUT_V[i-1]) / (LUT_V[i] - LUT_V[i-1]);
-            return LUT_SOC[i-1] + ratio * (LUT_SOC[i] - LUT_SOC[i-1]);
+    if (restingV <= LUT_V[0])
+        return 0.0f;
+    if (restingV >= LUT_V[N - 1])
+        return 100.0f;
+    for (int i = 1; i < N; i++)
+    {
+        if (restingV <= LUT_V[i])
+        {
+            float ratio = (restingV - LUT_V[i - 1]) / (LUT_V[i] - LUT_V[i - 1]);
+            return LUT_SOC[i - 1] + ratio * (LUT_SOC[i] - LUT_SOC[i - 1]);
         }
     }
     return 100.0f;
@@ -437,8 +512,10 @@ float calculateSOC(float rawVoltage, float signedCurrentA)
     float voltageSoc = voltageToSOC(rawVoltage, signedCurrentA);
 
     // ── Initial seed ─────────────────────────────────────────────────
-    if (socEstimate < 0.0f) {
-        if (rawVoltage < 3.0f) {
+    if (socEstimate < 0.0f)
+    {
+        if (rawVoltage < 3.0f)
+        {
             LOG("[SOC] Waiting for valid battery voltage...");
             return 0.0f;
         }
@@ -453,26 +530,31 @@ float calculateSOC(float rawVoltage, float signedCurrentA)
     // ── Elapsed time (RTC preferred, millis fallback) ─────────────────
     float elapsedHours = 0.0f;
 
-    if (rtcAvailable && rtcTimeValid && lastCoulombUnix > 0) {
-        uint32_t nowUnix  = (uint32_t)rtc.now().unixtime();
+    if (rtcAvailable && rtcTimeValid && lastCoulombUnix > 0)
+    {
+        uint32_t nowUnix = (uint32_t)rtc.now().unixtime();
         uint32_t deltaSec = (nowUnix > lastCoulombUnix) ? (nowUnix - lastCoulombUnix) : 0;
-        if (deltaSec > 180) deltaSec = 180;
-        elapsedHours    = deltaSec / 3600.0f;
+        if (deltaSec > 180)
+            deltaSec = 180;
+        elapsedHours = deltaSec / 3600.0f;
         lastCoulombUnix = nowUnix;
         LOGF("[SOC] Δt: DS3231 %lu s = %.5f h\n", deltaSec, elapsedHours);
-    } else {
-        uint32_t nowMs   = millis();
+    }
+    else
+    {
+        uint32_t nowMs = millis();
         uint32_t deltaMs = nowMs - lastCoulombMs;
-        if (deltaMs > 180000) deltaMs = 180000;
-        elapsedHours  = deltaMs / 3600000.0f;
+        if (deltaMs > 180000)
+            deltaMs = 180000;
+        elapsedHours = deltaMs / 3600000.0f;
         lastCoulombMs = nowMs;
         LOGF("[SOC] Δt: millis() %.5f h\n", elapsedHours);
     }
 
     // ── Coulomb integration ───────────────────────────────────────────
     float deltaSOC = (signedCurrentA * elapsedHours / BATTERY_CAPACITY_AH) * 100.0f;
-    socEstimate   += deltaSOC;
-    socEstimate    = constrain(socEstimate, 0.0f, 100.0f);
+    socEstimate += deltaSOC;
+    socEstimate = constrain(socEstimate, 0.0f, 100.0f);
 
     LOGF("[SOC] ΔSOC=%+.3f%%  Coulomb→%.1f%%  VLookup=%.1f%%\n",
          deltaSOC, socEstimate, voltageSoc);
@@ -480,27 +562,38 @@ float calculateSOC(float rawVoltage, float signedCurrentA)
     // ── Rest detection (5-minute confirmation window) ─────────────────
     uint32_t nowMs = millis();
 
-    if (fabs(signedCurrentA) < SOC_IDLE_CURRENT_THRESH_A) {
-        if (!isResting) {
-            isResting   = true;
+    if (fabs(signedCurrentA) < SOC_IDLE_CURRENT_THRESH_A)
+    {
+        if (!isResting)
+        {
+            isResting = true;
             restStartMs = nowMs;
-            anchorDone  = false;
+            anchorDone = false;
             LOG("[SOC] Rest timer started — waiting 5 min");
-        } else if (!anchorDone && (nowMs - restStartMs >= 300000UL)) {
+        }
+        else if (!anchorDone && (nowMs - restStartMs >= 300000UL))
+        {
             float before = socEstimate;
-            socEstimate  = (0.90f * socEstimate) + (0.10f * voltageSoc);
-            anchorDone   = true;
+            socEstimate = (0.90f * socEstimate) + (0.10f * voltageSoc);
+            anchorDone = true;
             LOGF("[SOC] ★ 5min REST ANCHOR: %.1f%% → %.1f%%  (VLookup=%.1f%%)\n",
                  before, socEstimate, voltageSoc);
-        } else if (!anchorDone) {
+        }
+        else if (!anchorDone)
+        {
             uint32_t waited = (nowMs - restStartMs) / 1000;
             LOGF("[SOC] Resting %lus/300s — Coulomb only\n", waited);
-        } else {
+        }
+        else
+        {
             LOG("[SOC] Idle — Coulomb only");
         }
-    } else {
-        if (isResting) {
-            isResting  = false;
+    }
+    else
+    {
+        if (isResting)
+        {
+            isResting = false;
             anchorDone = false;
             LOG("[SOC] Load/charge detected — rest cancelled");
         }
@@ -519,7 +612,8 @@ float calculateSOC(float rawVoltage, float signedCurrentA)
 
 void saveSOCToNVS()
 {
-    if (socEstimate < 0.0f) return;
+    if (socEstimate < 0.0f)
+        return;
     prefs.begin("crux", false);
     prefs.putFloat("soc", socEstimate);
     if (rtcAvailable && rtcTimeValid)
@@ -530,25 +624,28 @@ void saveSOCToNVS()
 void restoreSOCFromNVS()
 {
     prefs.begin("crux", true);
-    float    savedSOC = prefs.getFloat("soc", -1.0f);
-    uint32_t savedTS  = prefs.getUInt("ts",   0);
+    float savedSOC = prefs.getFloat("soc", -1.0f);
+    uint32_t savedTS = prefs.getUInt("ts", 0);
     prefs.end();
 
-    if (savedSOC < 0.0f || savedSOC > 100.0f) {
+    if (savedSOC < 0.0f || savedSOC > 100.0f)
+    {
         LOG("[NVS] No saved SOC — will seed from voltage on first read");
         return;
     }
 
-    float shunt_mV    = ina219.getShuntVoltage_mV();
-    float bus_V       = ina219.getBusVoltage_V();
+    float shunt_mV = ina219.getShuntVoltage_mV();
+    float bus_V = ina219.getBusVoltage_V();
     float liveVoltage = bus_V + (shunt_mV / 1000.0f);
 
-    if (liveVoltage >= 3.0f) {
+    if (liveVoltage >= 3.0f)
+    {
         float liveSOC = voltageToSOC(liveVoltage, 0.0f);
-        float diff    = fabs(savedSOC - liveSOC);
+        float diff = fabs(savedSOC - liveSOC);
         LOGF("[NVS] Saved=%.1f%%  LiveV=%.2fV  VLookup=%.1f%%  Diff=%.1f%%\n",
              savedSOC, liveVoltage, liveSOC, diff);
-        if (diff > SOC_REBOOT_MAX_DEVIATION) {
+        if (diff > SOC_REBOOT_MAX_DEVIATION)
+        {
             LOGF("[NVS] Deviation %.1f%% > %.1f%% — discarding saved SOC\n",
                  diff, SOC_REBOOT_MAX_DEVIATION);
             return;
@@ -557,27 +654,31 @@ void restoreSOCFromNVS()
 
     float restored = savedSOC;
 
-    if (rtcAvailable && rtcTimeValid && savedTS > 0) {
+    if (rtcAvailable && rtcTimeValid && savedTS > 0)
+    {
         uint32_t nowUnix = (uint32_t)rtc.now().unixtime();
-        uint32_t offSec  = (nowUnix > savedTS) ? (nowUnix - savedTS) : 0;
-        if (offSec > NVS_MAX_RESTORE_SECONDS) {
+        uint32_t offSec = (nowUnix > savedTS) ? (nowUnix - savedTS) : 0;
+        if (offSec > NVS_MAX_RESTORE_SECONDS)
+        {
             LOGF("[NVS] Off %lu s > %lu s limit — re-seeding from voltage\n",
                  offSec, NVS_MAX_RESTORE_SECONDS);
             return;
         }
-        float offHours  = offSec / 3600.0f;
+        float offHours = offSec / 3600.0f;
         float selfDisch = offHours * SELF_DISCHARGE_PCT_PER_HOUR;
-        restored       -= selfDisch;
-        restored        = constrain(restored, 0.0f, 100.0f);
+        restored -= selfDisch;
+        restored = constrain(restored, 0.0f, 100.0f);
         LOGF("[NVS] Off %.2fh → self-disch -%.2f%% → restored %.1f%%\n",
              offHours, selfDisch, restored);
-    } else {
+    }
+    else
+    {
         LOGF("[NVS] Restored SOC=%.1f%% (no RTC timestamp)\n", restored);
     }
 
-    socEstimate     = restored;
+    socEstimate = restored;
     lastCoulombUnix = savedTS;
-    lastCoulombMs   = millis();
+    lastCoulombMs = millis();
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -587,7 +688,8 @@ void restoreSOCFromNVS()
 // Returns "YYYY-MM-DD HH:MM:SS" or "T+NNNNs"
 String getTimestamp()
 {
-    if (rtcAvailable && rtcTimeValid) {
+    if (rtcAvailable && rtcTimeValid)
+    {
         DateTime t = rtc.now();
         char buf[24];
         snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
@@ -604,53 +706,77 @@ void ensureCSVHeader()
 {
     File f = SD.open(LOG_FILE, FILE_READ);
     bool hasContent = f && (f.size() > 0);
-    if (f) f.close();
-    if (hasContent) return;
+    if (f)
+        f.close();
+    if (hasContent)
+        return;
 
     File w = SD.open(LOG_FILE, FILE_WRITE);
-    if (w) {
+    if (w)
+    {
         w.println("row,timestamp,temperature_C,humidity_pct,voltage_V,"
-                  "current_A,power_W,soc_pct,state,synced");
+                  "current_A,power_W,soc_pct,charge_status,synced");
         w.close();
         LOG("[SD] CSV header written");
-    } else {
+    }
+    else
+    {
         LOG("[SD] ERROR: Could not write CSV header");
     }
 }
 
 void logRowToSD()
 {
-    if (!sdReady) {
+    if (!sdReady)
+    {
         LOG("[SD] Not ready — skipping local log");
         return;
     }
 
     logRowCount++;
-    String ts       = getTimestamp();
-    ChargeState st  = currentToState(signedCurrentA);
+    String ts = getTimestamp();
+    ChargeState st = currentToState(signedCurrentA);
+
+    // Server batteryDataSchema enum: "charging" | "discharging" | "idle"
+    const char *chargeStatusStr = "idle";
+    if (st == STATE_CHARGING)
+        chargeStatusStr = "charging";
+    if (st == STATE_DISCHARGING)
+        chargeStatusStr = "discharging";
 
     File f = SD.open(LOG_FILE, FILE_APPEND);
-    if (!f) {
+    if (!f)
+    {
         LOGF("[SD] ✗ FAILED to open log file for row %lu\n", logRowCount);
         logRowCount--;
         return;
     }
 
     // row,timestamp,temperature_C,humidity_pct,voltage_V,
-    // current_A,power_W,soc_pct,state,synced
-    f.print(logRowCount);           f.print(",");
-    f.print(ts);                    f.print(",");
-    f.print(sensorTemp,  1);        f.print(",");
-    f.print(sensorHumid, 1);        f.print(",");
-    f.print(sensorVoltage, 3);      f.print(",");
-    f.print(signedCurrentA, 4);     f.print(",");
-    f.print(sensorPower,   3);      f.print(",");
-    f.print(sensorSOC,     1);      f.print(",");
-    f.print(stateLabel(st));        f.print(",");
-    f.println("0");   // synced = 0 (not yet sent)
+    // current_A,power_W,soc_pct,charge_status,synced
+    f.print(logRowCount);
+    f.print(",");
+    f.print(ts);
+    f.print(",");
+    f.print(sensorTemp, 1);
+    f.print(",");
+    f.print(sensorHumid, 1);
+    f.print(",");
+    f.print(sensorVoltage, 3);
+    f.print(",");
+    f.print(signedCurrentA, 4);
+    f.print(",");
+    f.print(sensorPower, 3);
+    f.print(",");
+    f.print(sensorSOC, 1);
+    f.print(",");
+    f.print(chargeStatusStr);
+    f.print(",");
+    f.println("0"); // synced = 0 (not yet sent)
     f.close();
 
-    LOGF("[SD] ✓ Row %lu saved  @ %s  [offline]\n", logRowCount, ts.c_str());
+    LOGF("[SD] ✓ Row %lu saved  @ %s  chargeStatus=%s  [offline]\n",
+         logRowCount, ts.c_str(), chargeStatusStr);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -664,33 +790,44 @@ void markRowsSynced(uint32_t upToRow)
 {
     // Read entire file into memory
     File src = SD.open(LOG_FILE, FILE_READ);
-    if (!src) return;
+    if (!src)
+        return;
 
     // Build updated content in a temporary String (RAM permitting)
     // For very large files, use a temp file approach instead.
     String updated = "";
-    uint32_t lineNum = 0;  // 0 = header
+    uint32_t lineNum = 0; // 0 = header
 
-    while (src.available()) {
+    while (src.available())
+    {
         String line = src.readStringUntil('\n');
         line.trim();
 
-        if (lineNum == 0 || line.length() == 0) {
+        if (lineNum == 0 || line.length() == 0)
+        {
             // Keep header / empty lines unchanged
             updated += line + "\n";
-        } else {
+        }
+        else
+        {
             // Find last comma and check synced column
             int lastComma = line.lastIndexOf(',');
-            if (lastComma >= 0) {
+            if (lastComma >= 0)
+            {
                 String rowNumStr = line.substring(0, line.indexOf(','));
                 uint32_t rowN = (uint32_t)rowNumStr.toInt();
-                if (rowN <= upToRow) {
+                if (rowN <= upToRow)
+                {
                     // Replace synced column
                     updated += line.substring(0, lastComma + 1) + "1\n";
-                } else {
+                }
+                else
+                {
                     updated += line + "\n";
                 }
-            } else {
+            }
+            else
+            {
                 updated += line + "\n";
             }
         }
@@ -701,7 +838,8 @@ void markRowsSynced(uint32_t upToRow)
     // Rewrite
     SD.remove(LOG_FILE);
     File dst = SD.open(LOG_FILE, FILE_WRITE);
-    if (dst) {
+    if (dst)
+    {
         dst.print(updated);
         dst.close();
         LOGF("[SD] Marked rows 1-%lu as synced\n", upToRow);
@@ -714,79 +852,105 @@ void markRowsSynced(uint32_t upToRow)
 
 void flushOfflineRows()
 {
-    if (!sdReady) return;
+    if (!sdReady)
+        return;
 
     File f = SD.open(LOG_FILE, FILE_READ);
-    if (!f) return;
+    if (!f)
+        return;
 
-    bool       headerSkipped = false;
-    uint32_t   lastSyncedRow = 0;
-    bool       anySent       = false;
+    bool headerSkipped = false;
+    uint32_t lastSyncedRow = 0;
+    bool anySent = false;
 
     LOG("[FLUSH] Scanning SD for unsynced rows...");
 
-    while (f.available()) {
+    while (f.available())
+    {
         String line = f.readStringUntil('\n');
         line.trim();
-        if (line.length() == 0) continue;
+        if (line.length() == 0)
+            continue;
 
-        if (!headerSkipped) { headerSkipped = true; continue; }
-
-        // Parse CSV: row,timestamp,temp,humid,volt,curr,pwr,soc,state,synced
-        // Quick split by counting commas
-        int fields[10];  // positions of commas
-        int fc = 0;
-        for (int i = 0; i < (int)line.length() && fc < 9; i++) {
-            if (line.charAt(i) == ',') fields[fc++] = i;
+        if (!headerSkipped)
+        {
+            headerSkipped = true;
+            continue;
         }
-        if (fc < 9) continue;
+
+        // Parse CSV: row,timestamp,temp,humid,volt,curr,pwr,soc,charge_status,synced
+        // Quick split by counting commas
+        int fields[10]; // positions of commas
+        int fc = 0;
+        for (int i = 0; i < (int)line.length() && fc < 9; i++)
+        {
+            if (line.charAt(i) == ',')
+                fields[fc++] = i;
+        }
+        if (fc < 9)
+            continue;
 
         // Extract synced flag (last field)
         String syncedStr = line.substring(fields[8] + 1);
         syncedStr.trim();
-        if (syncedStr == "1") continue;  // already sent
+        if (syncedStr == "1")
+            continue; // already sent
 
         // Extract fields
-        String rowStr   = line.substring(0, fields[0]);
-        String ts       = line.substring(fields[0]+1, fields[1]);
-        String tempStr  = line.substring(fields[1]+1, fields[2]);
-        String humStr   = line.substring(fields[2]+1, fields[3]);
-        String voltStr  = line.substring(fields[3]+1, fields[4]);
-        String currStr  = line.substring(fields[4]+1, fields[5]);
-        String pwrStr   = line.substring(fields[5]+1, fields[6]);
-        String socStr   = line.substring(fields[6]+1, fields[7]);
-        String stateStr = line.substring(fields[7]+1, fields[8]);
+        String rowStr = line.substring(0, fields[0]);
+        String ts = line.substring(fields[0] + 1, fields[1]);
+        String tempStr = line.substring(fields[1] + 1, fields[2]);
+        String humStr = line.substring(fields[2] + 1, fields[3]);
+        String voltStr = line.substring(fields[3] + 1, fields[4]);
+        String currStr = line.substring(fields[4] + 1, fields[5]);
+        String pwrStr = line.substring(fields[5] + 1, fields[6]);
+        String socStr = line.substring(fields[6] + 1, fields[7]);
+        String chargeStatus = line.substring(fields[7] + 1, fields[8]);
+        chargeStatus.trim();
 
         uint32_t rowN = (uint32_t)rowStr.toInt();
 
-        // Build JSON payload (same structure as live sendSensorData)
+        // Validate chargeStatus against server enum
+        // batteryDataSchema: "charging" | "discharging" | "idle"
+        if (chargeStatus != "charging" && chargeStatus != "discharging")
+        {
+            chargeStatus = "idle";
+        }
+
+        // Build JSON payload matching server batteryDataSchema exactly
+        // recordedAt: ISO string so server stores the real historical time,
+        // not the flush time. Server controller: new Date(recordedAt).
 #if CRUX_USE_JSONDOC_V6
         StaticJsonDocument<JSON_DOC_CAPACITY> doc;
 #else
         JsonDocument doc;
 #endif
         doc["temperature"] = round1(tempStr.toFloat());
-        doc["voltage"]     = round2(voltStr.toFloat());
-        doc["power"]       = round2(pwrStr.toFloat());
-        doc["current"]     = round3(fabs(currStr.toFloat()));
-        doc["soc"]         = round1(socStr.toFloat());
-        doc["timestamp"]   = ts;          // historical timestamp
-        doc["offline"]     = true;        // flag so server knows it's backfill
+        doc["voltage"] = round2(voltStr.toFloat());
+        doc["power"] = round2(pwrStr.toFloat());
+        doc["current"] = round3(fabs(currStr.toFloat()));
+        doc["soc"] = round1(socStr.toFloat());
+        doc["chargeStatus"] = chargeStatus; // ← server enum field
+        doc["recordedAt"] = ts;             // ← ISO or T+Ns timestamp
 
-        char   jsonBuf[JSON_SERIAL_BUFFER];
+        char jsonBuf[JSON_SERIAL_BUFFER];
         size_t jsonLen = serializeJson(doc, jsonBuf, sizeof(jsonBuf));
-        if (jsonLen == 0 || jsonLen >= sizeof(jsonBuf)) continue;
+        if (jsonLen == 0 || jsonLen >= sizeof(jsonBuf))
+            continue;
 
         LOGF("[FLUSH] Sending offline row %lu  @ %s\n", rowN, ts.c_str());
 
         int code = httpPost(DATA_PATH, jsonBuf, jsonLen, DEVICE_ID, DEVICE_SECRET);
-        if (code == 200 || code == 201) {
+        if (code == 200 || code == 201)
+        {
             lastSyncedRow = rowN;
             anySent = true;
             LOGF("[FLUSH] ✓ Row %lu accepted (HTTP %d)\n", rowN, code);
-        } else {
+        }
+        else
+        {
             LOGF("[FLUSH] ✗ Row %lu rejected (HTTP %d) — stopping flush\n", rowN, code);
-            break;  // stop on first failure; retry next connection cycle
+            break; // stop on first failure; retry next connection cycle
         }
 
         esp_task_wdt_reset();
@@ -794,9 +958,12 @@ void flushOfflineRows()
 
     f.close();
 
-    if (anySent) {
+    if (anySent)
+    {
         markRowsSynced(lastSyncedRow);
-    } else {
+    }
+    else
+    {
         LOG("[FLUSH] No new rows to flush");
     }
 }
@@ -809,8 +976,10 @@ bool tryInitModem()
 {
     LOG("[MODEM] Powering on EC200U...");
     pinMode(MODEM_POWER, OUTPUT);
-    digitalWrite(MODEM_POWER, LOW);  delay(100);
-    digitalWrite(MODEM_POWER, HIGH); delay(1000);
+    digitalWrite(MODEM_POWER, LOW);
+    delay(100);
+    digitalWrite(MODEM_POWER, HIGH);
+    delay(1000);
     digitalWrite(MODEM_POWER, LOW);
     LOG("[MODEM] Power sequence done — waiting 5s for boot");
     delay(5000);
@@ -818,9 +987,11 @@ bool tryInitModem()
     SerialAT.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
     LOG("[MODEM] Initializing...");
 
-    if (!modem.init()) {
+    if (!modem.init())
+    {
         LOG("[MODEM] init() failed — trying restart()");
-        if (!modem.restart()) {
+        if (!modem.restart())
+        {
             LOG("[MODEM] restart() also failed — modem unavailable");
             return false;
         }
@@ -845,16 +1016,19 @@ bool tryInitModem()
 bool tryConnectNetwork()
 {
     LOG("[NET] Scanning for 4G network...");
-    if (!modem.waitForNetwork(NETWORK_TIMEOUT_MS, true)) {
+    if (!modem.waitForNetwork(NETWORK_TIMEOUT_MS, true))
+    {
         LOG("[NET] No network found — staying offline");
         return false;
     }
     LOGF("[NET] Registered (signal: %d/31)\n", modem.getSignalQuality());
 
     LOG("[NET] Connecting GPRS...");
-    if (!modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS)) {
+    if (!modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS))
+    {
         delay(5000);
-        if (!modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS)) {
+        if (!modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS))
+        {
             LOG("[NET] GPRS connect failed — staying offline");
             return false;
         }
@@ -865,12 +1039,16 @@ bool tryConnectNetwork()
 
 void ensureConnected()
 {
-    if (!modem.isNetworkConnected()) {
+    if (!modem.isNetworkConnected())
+    {
         LOG("[NET] Network lost — reconnecting");
         networkUp = tryConnectNetwork();
-    } else if (!modem.isGprsConnected()) {
+    }
+    else if (!modem.isGprsConnected())
+    {
         LOG("[NET] GPRS lost — reconnecting");
-        if (!modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS)) networkUp = false;
+        if (!modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS))
+            networkUp = false;
     }
 }
 
@@ -888,21 +1066,24 @@ void registerWithRetry()
 #else
     JsonDocument doc;
 #endif
-    doc["deviceId"]        = DEVICE_ID;
-    doc["deviceSecret"]    = DEVICE_SECRET;
-    doc["deviceName"]      = DEVICE_NAME;
+    doc["deviceId"] = DEVICE_ID;
+    doc["deviceSecret"] = DEVICE_SECRET;
+    doc["deviceName"] = DEVICE_NAME;
     doc["firmwareVersion"] = FIRMWARE_VER;
 
-    char   jsonBuf[JSON_SERIAL_BUFFER];
+    char jsonBuf[JSON_SERIAL_BUFFER];
     size_t jsonLen = serializeJson(doc, jsonBuf, sizeof(jsonBuf));
-    if (jsonLen == 0 || jsonLen >= sizeof(jsonBuf)) {
+    if (jsonLen == 0 || jsonLen >= sizeof(jsonBuf))
+    {
         LOG("[REG] JSON serialize error");
         return;
     }
 
-    for (int i = 1; i <= 5; i++) {
+    for (int i = 1; i <= 5; i++)
+    {
         int code = httpPost(REGISTER_PATH, jsonBuf, jsonLen, nullptr, nullptr);
-        if (code == 200 || code == 201) {
+        if (code == 200 || code == 201)
+        {
             registered = true;
             LOG("[REG] Registered\n");
             return;
@@ -917,20 +1098,32 @@ bool sendSensorData()
 {
     LOG("[DATA] Sending live data...");
 
+    ChargeState liveState = currentToState(signedCurrentA);
+
+    // Map ChargeState → server enum string
+    // Server batteryDataSchema: "charging" | "discharging" | "idle"
+    const char *chargeStatusStr = "idle";
+    if (liveState == STATE_CHARGING)
+        chargeStatusStr = "charging";
+    if (liveState == STATE_DISCHARGING)
+        chargeStatusStr = "discharging";
+
 #if CRUX_USE_JSONDOC_V6
     StaticJsonDocument<JSON_DOC_CAPACITY> doc;
 #else
     JsonDocument doc;
 #endif
     doc["temperature"] = round1(sensorTemp);
-    doc["voltage"]     = round2(sensorVoltage);
-    doc["power"]       = round2(sensorPower);
-    doc["current"]     = round3(sensorCurrent);
-    doc["soc"]         = round1(sensorSOC);
+    doc["voltage"] = round2(sensorVoltage);
+    doc["power"] = round2(sensorPower);
+    doc["current"] = round3(sensorCurrent);
+    doc["soc"] = round1(sensorSOC);
+    doc["chargeStatus"] = chargeStatusStr; // ← now sent to server
 
-    char   jsonBuf[JSON_SERIAL_BUFFER];
+    char jsonBuf[JSON_SERIAL_BUFFER];
     size_t jsonLen = serializeJson(doc, jsonBuf, sizeof(jsonBuf));
-    if (jsonLen == 0 || jsonLen >= sizeof(jsonBuf)) {
+    if (jsonLen == 0 || jsonLen >= sizeof(jsonBuf))
+    {
         LOG("[DATA] JSON serialize error");
         return false;
     }
@@ -938,12 +1131,14 @@ bool sendSensorData()
     LOGF("[DATA] Payload: %s\n", jsonBuf);
 
     int code = httpPost(DATA_PATH, jsonBuf, jsonLen, DEVICE_ID, DEVICE_SECRET);
-    if (code == 200 || code == 201) {
+    if (code == 200 || code == 201)
+    {
         LOGF("[DATA] ✓ HTTP %d\n\n", code);
         return true;
     }
     LOGF("[DATA] ✗ HTTP %d\n", code);
-    if (code == 404) registered = false;
+    if (code == 404)
+        registered = false;
     return false;
 }
 
@@ -954,14 +1149,17 @@ bool sendSensorData()
 static int httpPost(const char *path, const char *body, size_t bodyLen,
                     const char *devId, const char *devSecret)
 {
-    for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-        if (attempt > 1) {
+    for (int attempt = 1; attempt <= MAX_RETRIES; attempt++)
+    {
+        if (attempt > 1)
+        {
             LOGF("[HTTP] Retry %d/%d\n", attempt, MAX_RETRIES);
             delay(RETRY_BACKOFF_MS * attempt);
         }
 
         LOGF("[HTTP] Connect %s:%d\n", SERVER_HOST, SERVER_PORT);
-        if (!netClient.connect(SERVER_HOST, SERVER_PORT)) {
+        if (!netClient.connect(SERVER_HOST, SERVER_PORT))
+        {
             LOG("[HTTP] TCP connect failed");
             netClient.stop();
             continue;
@@ -969,7 +1167,7 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
 
         // ── Build request headers on stack ────────────────────────────
         char hdrs[HTTP_HEADER_BUFFER];
-        int  h = snprintf(
+        int h = snprintf(
             hdrs, sizeof(hdrs),
             "POST %s HTTP/1.1\r\n"
             "Host: %s\r\n"
@@ -978,19 +1176,22 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
             "Connection: close\r\n",
             path, SERVER_HOST, (unsigned)bodyLen);
 
-        if (h <= 0 || (size_t)h >= sizeof(hdrs) - 96) {
+        if (h <= 0 || (size_t)h >= sizeof(hdrs) - 96)
+        {
             LOG("[HTTP] header base truncated");
             netClient.stop();
             continue;
         }
 
         int pos = h;
-        if (devId && devSecret) {
+        if (devId && devSecret)
+        {
             int a = snprintf(
                 hdrs + pos, sizeof(hdrs) - (size_t)pos,
                 "x-device-id: %s\r\nx-device-secret: %s\r\n",
                 devId, devSecret);
-            if (a <= 0 || pos + a >= (int)sizeof(hdrs) - 8) {
+            if (a <= 0 || pos + a >= (int)sizeof(hdrs) - 8)
+            {
                 LOG("[HTTP] auth header truncated");
                 netClient.stop();
                 continue;
@@ -999,7 +1200,11 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
         }
 
         int fin = snprintf(hdrs + pos, sizeof(hdrs) - (size_t)pos, "\r\n");
-        if (fin < 2) { netClient.stop(); continue; }
+        if (fin < 2)
+        {
+            netClient.stop();
+            continue;
+        }
         pos += fin;
 
         netClient.write((const uint8_t *)hdrs, (size_t)pos);
@@ -1007,8 +1212,10 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
 
         // ── Wait for response ─────────────────────────────────────────
         uint32_t t0 = millis();
-        while (!netClient.available() && millis() - t0 < HTTP_TIMEOUT_MS) delay(50);
-        if (!netClient.available()) {
+        while (!netClient.available() && millis() - t0 < HTTP_TIMEOUT_MS)
+            delay(50);
+        if (!netClient.available())
+        {
             LOG("[HTTP] timeout waiting for response");
             netClient.stop();
             continue;
@@ -1022,27 +1229,30 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
         LOGF("[HTTP] ← %d\n", statusCode);
 
         // Skip response headers
-        while (netClient.available()) {
+        while (netClient.available())
+        {
             String line = netClient.readStringUntil('\n');
-            if (line.length() <= 1) break;
+            if (line.length() <= 1)
+                break;
         }
 
         // Drain body (log snippet)
-        char   respBuf[HTTP_RESP_BODY_MAX];
+        char respBuf[HTTP_RESP_BODY_MAX];
         size_t respN = 0;
         uint32_t readStart = millis();
-        while (netClient.available() && millis() - readStart < 3000
-               && respN < sizeof(respBuf) - 1) {
+        while (netClient.available() && millis() - readStart < 3000 && respN < sizeof(respBuf) - 1)
+        {
             respBuf[respN++] = (char)netClient.read();
         }
         respBuf[respN] = '\0';
-        if (respN > 0) LOGF("[HTTP] Body: %s\n", respBuf);
+        if (respN > 0)
+            LOGF("[HTTP] Body: %s\n", respBuf);
 
         netClient.stop();
 
-        if (statusCode >= 200 && statusCode < 300) return statusCode;
-        if (statusCode >= 400 && statusCode < 500
-            && statusCode != 408 && statusCode != 429)
+        if (statusCode >= 200 && statusCode < 300)
+            return statusCode;
+        if (statusCode >= 400 && statusCode < 500 && statusCode != 408 && statusCode != 429)
             return statusCode;
     }
 
@@ -1053,6 +1263,6 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
 // ═════════════════════════════════════════════════════════════════════
 //  HELPERS
 // ═════════════════════════════════════════════════════════════════════
-float round1(float v) { return ((int)(v * 10   + 0.5f)) / 10.0f;   }
-float round2(float v) { return ((int)(v * 100  + 0.5f)) / 100.0f;  }
+float round1(float v) { return ((int)(v * 10 + 0.5f)) / 10.0f; }
+float round2(float v) { return ((int)(v * 100 + 0.5f)) / 100.0f; }
 float round3(float v) { return ((int)(v * 1000 + 0.5f)) / 1000.0f; }
