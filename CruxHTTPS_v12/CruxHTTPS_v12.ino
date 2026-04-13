@@ -131,6 +131,18 @@ void initSD()
     }
 }
 
+// Helper: derive charge status string from INA219 current
+const char* deriveChargeStatus()
+{
+    float signedCurrent = (ina219.getCurrent_mA() / 1000.0f) * (float)ACS712_CHARGE_DIRECTION;
+    if (fabs(signedCurrent) < SOC_IDLE_CURRENT_THRESH_A)
+        return "idle";
+    else if (signedCurrent >= 0)
+        return "charging";
+    else
+        return "discharging";
+}
+
 void bufferToDisk()
 {
     if (!sdAvailable) return;
@@ -143,10 +155,11 @@ void bufferToDisk()
     }
 
     uint32_t ts = rtcAvailable && rtcTimeValid ? (uint32_t)rtc.now().unixtime() : 0;
-    f.printf("%lu,%.1f,%.2f,%.2f,%.3f,%.1f\n",
-             ts, sensorTemp, sensorVoltage, sensorPower, sensorCurrent, sensorSOC);
+    const char* status = deriveChargeStatus();
+    f.printf("%lu,%.1f,%.2f,%.2f,%.3f,%.1f,%s\n",
+             ts, sensorTemp, sensorVoltage, sensorPower, sensorCurrent, sensorSOC, status);
     f.close();
-    LOGF("[SD] Buffered to disk (ts=%lu)\n", ts);
+    LOGF("[SD] Buffered to disk (ts=%lu, status=%s)\n", ts, status);
 }
 
 void flushSDBuffer()
@@ -175,21 +188,27 @@ void flushSDBuffer()
     {
         float t, v, p, c, s;
         uint32_t ts;
-        int parsed = sscanf(lines[i].c_str(), "%lu,%f,%f,%f,%f,%f", &ts, &t, &v, &p, &c, &s);
+        char statusBuf[16] = "";
+
+        // Try parsing with chargeStatus (new format)
+        int parsed = sscanf(lines[i].c_str(), "%lu,%f,%f,%f,%f,%f,%15s", &ts, &t, &v, &p, &c, &s, statusBuf);
         if (parsed < 6) continue;
 
-        char body[192];
+        // Default to "idle" if status field wasn't in the buffered record
+        const char* status = (parsed >= 7 && strlen(statusBuf) > 0) ? statusBuf : "idle";
+
+        char body[256];
         if (ts > 0)
         {
             snprintf(body, sizeof(body),
-                     "{\"temperature\":%.1f,\"voltage\":%.2f,\"power\":%.2f,\"current\":%.3f,\"soc\":%.1f,\"recordedAt\":%lu}",
-                     t, v, p, c, s, ts);
+                     "{\"temperature\":%.1f,\"voltage\":%.2f,\"power\":%.2f,\"current\":%.3f,\"soc\":%.1f,\"chargeStatus\":\"%s\",\"recordedAt\":%lu}",
+                     t, v, p, c, s, status, ts);
         }
         else
         {
             snprintf(body, sizeof(body),
-                     "{\"temperature\":%.1f,\"voltage\":%.2f,\"power\":%.2f,\"current\":%.3f,\"soc\":%.1f}",
-                     t, v, p, c, s);
+                     "{\"temperature\":%.1f,\"voltage\":%.2f,\"power\":%.2f,\"current\":%.3f,\"soc\":%.1f,\"chargeStatus\":\"%s\"}",
+                     t, v, p, c, s, status);
         }
 
         int code = httpPost(DATA_PATH, body, strlen(body), DEVICE_ID, DEVICE_SECRET);
@@ -856,16 +875,20 @@ bool sendSensorData()
 {
     LOG("[DATA] Sending...");
 
+    // Derive charge status from signed current
+    const char* chargeStatus = deriveChargeStatus();
+
 #if CRUX_USE_JSONDOC_V6
     StaticJsonDocument<JSON_DOC_CAPACITY> doc;
 #else
     JsonDocument doc;
 #endif
-    doc["temperature"] = round1(sensorTemp);
-    doc["voltage"]     = round2(sensorVoltage);
-    doc["power"]       = round2(sensorPower);
-    doc["current"]     = round3(sensorCurrent);
-    doc["soc"]         = round1(sensorSOC);
+    doc["temperature"]  = round1(sensorTemp);
+    doc["voltage"]      = round2(sensorVoltage);
+    doc["power"]        = round2(sensorPower);
+    doc["current"]      = round3(sensorCurrent);
+    doc["soc"]          = round1(sensorSOC);
+    doc["chargeStatus"] = chargeStatus;
 
     char   jsonBuf[JSON_SERIAL_BUFFER];
     size_t jsonLen = serializeJson(doc, jsonBuf, sizeof(jsonBuf));

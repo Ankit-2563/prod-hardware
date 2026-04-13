@@ -112,7 +112,7 @@
 // ─────────────────────────────────────────────────────────────────
 //  DEBUG
 // ─────────────────────────────────────────────────────────────────
-#define ENABLE_DEBUG true
+#define ENABLE_DEBUG false   // no serial output in production
 #define SERIAL_BAUD  115200
 // #define DUMP_AT_COMMANDS
 
