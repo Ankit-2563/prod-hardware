@@ -12,7 +12,7 @@
 #include <esp_task_wdt.h>
 
 // ── TinyGSM must be configured BEFORE the include ────────────────────
-#define TINY_GSM_MODEM_EC200U
+#define TINY_GSM_MODEM_BG96
 #define TINY_GSM_USE_GPRS true
 #define SerialAT Serial1
 #define SerialMon Serial
@@ -277,9 +277,15 @@ void setup()
 
     powerOnModem();
     initModem();
-    waitForNetwork();
-    connectGPRS();
-    registerWithRetry();
+    // Attempt initial connection, but don't strictly require it
+    bool netOk = waitForNetwork(NETWORK_TIMEOUT_MS);
+    if (netOk) {
+        if (connectGPRS()) {
+            registerWithRetry();
+        }
+    } else {
+        LOG("[BOOT] Note: Starting offline. Will log to SD and connect later.");
+    }
 
     bootTime = millis();
     LOG("\n[BOOT] Setup complete — entering main loop\n");
@@ -304,32 +310,49 @@ void setup()
 
 void loop()
 {
-    ensureConnected();
-    if (!registered)
-        registerWithRetry();
-
     uint32_t now = millis();
 
-    if (registered && (now - lastSendMs >= SEND_INTERVAL_MS))
+    // Process sensors and connectivity exactly every SEND_INTERVAL_MS (60s)
+    if (now - lastSendMs >= SEND_INTERVAL_MS)
     {
         lastSendMs = now;
 
+        // 1. ALWAYS read autonomous logs
         readAllSensors();
         saveSOCToNVS();
+        updateChargeCycles(sensorSOC);
 
-        bool ok = sendSensorData();
-        if (ok)
+        // 2. Check dynamically if we have cellular paths open
+        bool online = ensureConnected();
+
+        if (online)
         {
-            successCount++;
-            flushSDBuffer();
+            if (!registered) registerWithRetry();
+
+            if (registered)
+            {
+                if (sendSensorData())
+                {
+                    successCount++;
+                    flushSDBuffer();
+                }
+                else
+                {
+                    failCount++;
+                    bufferToDisk();
+                }
+            }
+            else
+            {
+                LOG("[NET] Still unregistered — buffering to SD");
+                bufferToDisk();
+            }
         }
         else
         {
-            failCount++;
+            LOG("[NET] Offline — buffering to SD");
             bufferToDisk();
         }
-
-        updateChargeCycles(sensorSOC);
 
         uint32_t upSec = (millis() - bootTime) / 1000;
         LOGF("[STATS] Uptime: %lum %lus | Sent: %lu ok, %lu fail\n",
@@ -340,7 +363,7 @@ void loop()
 
     uint32_t delayMs = LOOP_DELAY_MS;
 #if ADAPTIVE_LOOP_DELAY
-    if (registered && lastSendMs != 0)
+    if (lastSendMs != 0)
     {
         uint32_t nextSend = lastSendMs + SEND_INTERVAL_MS;
         if (nextSend > now)
@@ -788,53 +811,50 @@ void initModem()
     LOG("[MODEM] Ready\n");
 }
 
-void waitForNetwork()
+bool waitForNetwork(uint32_t timeoutMs = NETWORK_TIMEOUT_MS)
 {
     LOG("[NET] Scanning for 4G network...");
-    if (!modem.waitForNetwork(NETWORK_TIMEOUT_MS, true))
+    if (!modem.waitForNetwork(timeoutMs, true))
     {
-        LOG("[NET] ✗ No network — rebooting in 30s");
-        delay(30000);
-        ESP.restart();
+        LOG("[NET] ✗ No network found");
+        return false;
     }
     LOGF("[NET] Registered (signal: %d/31)\n", modem.getSignalQuality());
+    return true;
 }
 
-void connectGPRS()
+bool connectGPRS()
 {
     LOG("[NET] Connecting GPRS...");
     if (!modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS))
     {
-        delay(10000);
-        if (!modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS))
-        {
-            delay(5000);
-            ESP.restart();
-        }
+        LOG("[NET] ✗ GPRS connection failed");
+        return false;
     }
     LOG("[NET] GPRS connected — IP: " + modem.getLocalIP());
+    return true;
 }
 
-void ensureConnected()
+bool ensureConnected()
 {
     if (!modem.isNetworkConnected())
     {
-        LOG("[NET] Network lost — reconnecting");
-        waitForNetwork();
-        connectGPRS();
+        LOG("[NET] Network lost — reconnecting...");
+        if (!waitForNetwork(30000)) return false; // 30s max loop block so offline isn't frozen
     }
     if (!modem.isGprsConnected())
     {
-        LOG("[NET] GPRS lost — reconnecting");
-        connectGPRS();
+        LOG("[NET] GPRS lost — reconnecting...");
+        if (!connectGPRS()) return false;
     }
+    return true;
 }
 
 // ═════════════════════════════════════════════════════════════════════
 //  HTTP — registration + data sending (from v4)
 // ═════════════════════════════════════════════════════════════════════
 
-void registerWithRetry()
+bool registerWithRetry()
 {
     LOG("[REG] Registering device...");
 
@@ -853,22 +873,23 @@ void registerWithRetry()
     if (jsonLen == 0 || jsonLen >= sizeof(jsonBuf))
     {
         LOG("[REG] JSON serialize error or buffer full");
-        return;
+        return false;
     }
 
-    for (int i = 1; i <= 5; i++)
+    for (int i = 1; i <= 3; i++) // Reduced to 3 to prevent huge hangs if offline
     {
         int code = httpPost(REGISTER_PATH, jsonBuf, jsonLen, nullptr, nullptr);
         if (code == 200 || code == 201)
         {
             registered = true;
             LOG("[REG] Registered\n");
-            return;
+            return true;
         }
         LOGF("[REG] Attempt %d failed (HTTP %d)\n", i, code);
-        delay(REGISTER_RETRY_MS);
+        if (i < 3) delay(REGISTER_RETRY_MS);
     }
-    LOG("[REG] Will retry in main loop\n");
+    LOG("[REG] Registration failed (offline?)");
+    return false;
 }
 
 bool sendSensorData()
