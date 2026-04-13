@@ -102,6 +102,10 @@ bool     cycleInProgress   = false;   // true once SOC dropped below LOW mark
 // Forward declaration
 static int httpPost(const char *path, const char *body, size_t bodyLen,
                     const char *devId, const char *devSecret);
+bool waitForNetwork(uint32_t timeoutMs = NETWORK_TIMEOUT_MS);
+bool connectGPRS();
+bool ensureConnected();
+bool registerWithRetry();
 
 // ═════════════════════════════════════════════════════════════════════
 //  SD CARD LOGIC
@@ -811,7 +815,7 @@ void initModem()
     LOG("[MODEM] Ready\n");
 }
 
-bool waitForNetwork(uint32_t timeoutMs = NETWORK_TIMEOUT_MS)
+bool waitForNetwork(uint32_t timeoutMs)
 {
     LOG("[NET] Scanning for 4G network...");
     if (!modem.waitForNetwork(timeoutMs, true))
