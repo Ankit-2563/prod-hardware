@@ -70,11 +70,8 @@
 // ─────────────────────────────────────────────────────────────────
 //  TIMING & LOOP
 // ─────────────────────────────────────────────────────────────────
-#define LOOP_DELAY_MS       1000
-#define ADAPTIVE_LOOP_DELAY true
-#define LOOP_DELAY_MIN_MS     50
-
 #define SEND_INTERVAL_MS   60000UL   // 1 request per minute
+#define SOC_SAMPLE_MS       1000     // INA219 + Coulomb update interval
 
 #define REGISTER_RETRY_MS  10000
 #define NETWORK_TIMEOUT_MS 180000

@@ -65,8 +65,9 @@ const uint8_t dhtTypes[TEMP_SENSOR_COUNT] = { DHT0_TYPE, DHT1_TYPE, DHT2_TYPE, D
 // ═════════════════════════════════════════════════════════════════════
 
 bool     registered   = false;
-uint32_t lastSendMs   = 0;
-uint32_t bootTime     = 0;
+uint32_t lastSendMs        = 0;
+uint32_t lastCoulombMs_loop = 0;
+uint32_t bootTime          = 0;
 uint32_t successCount = 0;
 uint32_t failCount    = 0;
 
@@ -85,6 +86,10 @@ float    lastValidVoltage = 0.0;
 
 bool rtcAvailable = false;
 bool rtcTimeValid = false;
+
+// Cached RTC reading — updated once per second in updateSOCOnly()
+DateTime cachedRtcNow;
+uint32_t cachedRtcUnix = 0;
 
 // Rest-detection state for idle correction
 uint32_t restStartMs = 0;
@@ -119,6 +124,7 @@ void setup()
     initModem();
     waitForNetwork();
     connectGPRS();
+    syncRTCFromNetwork();
     registerWithRetry();
 
     bootTime = millis();
@@ -139,7 +145,7 @@ void setup()
 }
 
 // ═════════════════════════════════════════════════════════════════════
-//  LOOP — read sensors every second, send data every 60 seconds
+//  LOOP — Coulomb counting every 1s, data send every 60s
 // ═════════════════════════════════════════════════════════════════════
 
 void loop()
@@ -150,11 +156,19 @@ void loop()
 
     uint32_t now = millis();
 
+    // ── Coulomb counting every second (captures current spikes) ──────
+    if (now - lastCoulombMs_loop >= SOC_SAMPLE_MS)
+    {
+        lastCoulombMs_loop = now;
+        updateSOCOnly();
+    }
+
+    // ── Full sensor read + send every 60 seconds ─────────────────────
     if (registered && (now - lastSendMs >= SEND_INTERVAL_MS))
     {
         lastSendMs = now;
 
-        readAllSensors();
+        readAllSensors();   // DHT only — INA219/SOC already fresh
         saveSOCToNVS();
 
         bool ok = sendSensorData();
@@ -167,23 +181,7 @@ void loop()
     }
 
     esp_task_wdt_reset();
-
-    uint32_t delayMs = LOOP_DELAY_MS;
-#if ADAPTIVE_LOOP_DELAY
-    if (registered && lastSendMs != 0)
-    {
-        uint32_t nextSend = lastSendMs + SEND_INTERVAL_MS;
-        if (nextSend > now)
-        {
-            uint32_t until = nextSend - now;
-            if (until < delayMs)
-                delayMs = until;
-        }
-    }
-    if (delayMs < (uint32_t)LOOP_DELAY_MIN_MS)
-        delayMs = LOOP_DELAY_MIN_MS;
-#endif
-    delay(delayMs);
+    delay(10);
 }
 
 // ═════════════════════════════════════════════════════════════════════
@@ -261,7 +259,101 @@ void initSensors()
 }
 
 // ═════════════════════════════════════════════════════════════════════
-//  READ ALL SENSORS
+//  RTC SYNC — set DS3231 from cellular network time (NITZ)
+// ═════════════════════════════════════════════════════════════════════
+
+void syncRTCFromNetwork()
+{
+    if (!rtcAvailable)
+    {
+        LOG("[RTC] No RTC — skipping network time sync");
+        return;
+    }
+
+    LOG("[RTC] Syncing from network time...");
+
+    // Enable automatic timezone update from network (NITZ)
+    modem.sendAT("+CTZU=1");
+    modem.waitResponse(1000);
+    delay(1000);  // Give modem time to update clock from network
+
+    // Query modem clock — returns local time from NITZ
+    // Format: "YY/MM/DD,HH:MM:SS±ZZ"  (ZZ = quarter-hours offset)
+    String dt = modem.getGSMDateTime(DATE_FULL);
+    LOG("[RTC] Modem time string: " + dt);
+
+    if (dt.length() < 17)
+    {
+        LOG("[RTC] ✗ Could not get valid time from modem — keeping current RTC");
+        return;
+    }
+
+    int yr = dt.substring(0, 2).toInt() + 2000;
+    int mo = dt.substring(3, 5).toInt();
+    int dy = dt.substring(6, 8).toInt();
+    int hr = dt.substring(9, 11).toInt();
+    int mi = dt.substring(12, 14).toInt();
+    int sc = dt.substring(15, 17).toInt();
+
+    // Sanity check
+    if (yr < 2024 || yr > 2099 || mo < 1 || mo > 12 || dy < 1 || dy > 31 ||
+        hr > 23 || mi > 59 || sc > 59)
+    {
+        LOGF("[RTC] ✗ Invalid date/time: %04d-%02d-%02d %02d:%02d:%02d — skipping\n",
+             yr, mo, dy, hr, mi, sc);
+        return;
+    }
+
+    rtc.adjust(DateTime(yr, mo, dy, hr, mi, sc));
+    rtcTimeValid = true;
+
+    LOGF("[RTC] ✓ Synced to network: %04d-%02d-%02d %02d:%02d:%02d\n",
+         yr, mo, dy, hr, mi, sc);
+}
+
+// ═════════════════════════════════════════════════════════════════════
+//  FAST SOC UPDATE (called every 1 second from loop)
+//  Reads INA219 + updates Coulomb counter — no DHT, no serial spam
+// ═════════════════════════════════════════════════════════════════════
+
+void updateSOCOnly()
+{
+    // Cache RTC time once per second — all other functions use cached value
+    if (rtcAvailable && rtcTimeValid)
+    {
+        cachedRtcNow  = rtc.now();
+        cachedRtcUnix = cachedRtcNow.unixtime();
+    }
+
+    // Read INA219
+    float shunt_mV   = ina219.getShuntVoltage_mV();
+    float bus_V      = ina219.getBusVoltage_V();
+    float current_mA = ina219.getCurrent_mA();
+    float rawVoltage = bus_V + (shunt_mV / 1000.0f);
+
+    // Voltage glitch filter
+    if (rawVoltage >= 3.0f)
+    {
+        sensorVoltage    = rawVoltage;
+        lastValidVoltage = rawVoltage;
+    }
+    else if (lastValidVoltage > 0.0f)
+    {
+        sensorVoltage = lastValidVoltage;
+    }
+
+    float signedCurrent_A = (current_mA / 1000.0f)
+                            * (float)ACS712_CHARGE_DIRECTION;
+    sensorCurrent = fabs(signedCurrent_A);
+    sensorPower   = ina219.getPower_mW() / 1000.0f;
+
+    // Update SOC with fresh 1-second current sample
+    sensorSOC = calculateSOC(sensorVoltage, signedCurrent_A);
+}
+
+// ═════════════════════════════════════════════════════════════════════
+//  READ ALL SENSORS (called every 60s — DHT + display only)
+//  INA219 / SOC are already up-to-date from updateSOCOnly()
 // ═════════════════════════════════════════════════════════════════════
 
 void readAllSensors()
@@ -269,7 +361,7 @@ void readAllSensors()
     LOG("[SENSOR] ── Reading ──");
 
     // ── Temperature (DHT average) ────────────────────────────────────
-    float tempSum  = 0.0;
+    float tempSum   = 0.0f;
     int   tempCount = 0;
 
     for (int i = 0; i < TEMP_SENSOR_COUNT; i++)
@@ -313,48 +405,21 @@ void readAllSensors()
 
     esp_task_wdt_reset();
 
-    // ── INA219 (voltage, current, power) ─────────────────────────────
-    float shunt_mV   = ina219.getShuntVoltage_mV();
-    float bus_V      = ina219.getBusVoltage_V();
-    float current_mA = ina219.getCurrent_mA();
-    float rawVoltage = bus_V + (shunt_mV / 1000.0);
-
-    if (rawVoltage >= 3.0)
-    {
-        sensorVoltage    = rawVoltage;
-        lastValidVoltage = rawVoltage;
-    }
-    else if (lastValidVoltage > 0.0)
-    {
-        sensorVoltage = lastValidVoltage;
-        LOG("[SENSOR] Voltage glitch — using last valid");
-    }
-    else
-    {
-        sensorVoltage = rawVoltage;
-    }
-
-    float signedCurrent_A = (current_mA / 1000.0) * (float)ACS712_CHARGE_DIRECTION;
-    sensorCurrent = fabs(signedCurrent_A);
-    sensorPower   = ina219.getPower_mW() / 1000.0;
-
-    // ── SOC ──────────────────────────────────────────────────────────
-    sensorSOC = calculateSOC(sensorVoltage, signedCurrent_A);
-
-    // ── Print everything ─────────────────────────────────────────────
+    // ── Print everything (INA219/SOC already fresh from updateSOCOnly) ──
     LOGF("[SENSOR]   Temperature: %.1f °C\n", sensorTemp);
     LOGF("[SENSOR]   Humidity   : %.1f %%\n", sensorHumid);
     LOGF("[SENSOR]   Voltage    : %.2f V\n",  sensorVoltage);
     LOGF("[SENSOR]   Current    : %.3f A (%s)\n",
-         sensorCurrent, signedCurrent_A >= 0 ? "charging" : "discharging");
+         sensorCurrent,
+         (sensorCurrent > 0.001f) ? "discharging" : "idle");
     LOGF("[SENSOR]   Power      : %.2f W\n",  sensorPower);
     LOGF("[SENSOR]   SOC        : %.1f %%\n", sensorSOC);
 
     if (rtcAvailable && rtcTimeValid)
     {
-        DateTime t = rtc.now();
         LOGF("[SENSOR]   RTC Time   : %04d-%02d-%02d %02d:%02d:%02d\n",
-             t.year(), t.month(), t.day(), t.hour(), t.minute(), t.second());
+             cachedRtcNow.year(), cachedRtcNow.month(), cachedRtcNow.day(),
+             cachedRtcNow.hour(), cachedRtcNow.minute(), cachedRtcNow.second());
     }
 
     LOG("[SENSOR] ────────────\n");
@@ -406,7 +471,7 @@ float calculateSOC(float rawVoltage, float signedCurrentA)
         socEstimate = voltageSoc;
 
         if (rtcAvailable && rtcTimeValid)
-            lastCoulombUnix = (uint32_t)rtc.now().unixtime();
+            lastCoulombUnix = cachedRtcUnix;
         lastCoulombMs = millis();
 
         LOGF("[SOC] ★ Seeded from voltage LUT: %.1f%%  (V=%.2f)\n",
@@ -419,7 +484,7 @@ float calculateSOC(float rawVoltage, float signedCurrentA)
 
     if (rtcAvailable && rtcTimeValid && lastCoulombUnix > 0)
     {
-        uint32_t nowUnix  = (uint32_t)rtc.now().unixtime();
+        uint32_t nowUnix  = cachedRtcUnix;
         uint32_t deltaSec = (nowUnix > lastCoulombUnix) ? (nowUnix - lastCoulombUnix) : 0;
 
         uint32_t maxSec = 180; // Sanity cap
@@ -515,7 +580,7 @@ void saveSOCToNVS()
     prefs.begin("crux", false);
     prefs.putFloat("soc", socEstimate);
     if (rtcAvailable && rtcTimeValid)
-        prefs.putUInt("ts", (uint32_t)rtc.now().unixtime());
+        prefs.putUInt("ts", cachedRtcUnix);
     prefs.end();
 }
 
