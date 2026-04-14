@@ -243,10 +243,16 @@ float calculateSOC(float rawVoltage, float signedCurrentA)
     float voltageSoc = voltageToSOC(rawVoltage, signedCurrentA);
     if (socEstimate < 0.0)
     {
-        if (rawVoltage < 3.0) return 0.0;
+        if (rawVoltage < 3.0)
+        {
+            LOG("[SOC] Waiting for valid battery voltage...");
+            return 0.0;
+        }
         socEstimate = voltageSoc;
-        if (rtcAvailable && rtcTimeValid) lastCoulombUnix = (uint32_t)rtc.now().unixtime();
+        if (rtcAvailable && rtcTimeValid)
+            lastCoulombUnix = (uint32_t)rtc.now().unixtime();
         lastCoulombMs = millis();
+        LOGF("[SOC] Seeded from voltage LUT: %.1f%% (V=%.2f)\n", socEstimate, rawVoltage);
         return socEstimate;
     }
 
@@ -258,6 +264,7 @@ float calculateSOC(float rawVoltage, float signedCurrentA)
         if (deltaSec > 180) deltaSec = 180;
         elapsedHours = deltaSec / 3600.0;
         lastCoulombUnix = nowUnix;
+        LOGF("[SOC] dt RTC: %lus (%.5fh)\n", deltaSec, elapsedHours);
     }
     else
     {
@@ -266,9 +273,43 @@ float calculateSOC(float rawVoltage, float signedCurrentA)
         if (deltaMs > 180000) deltaMs = 180000;
         elapsedHours = deltaMs / 3600000.0;
         lastCoulombMs = nowMs;
+        LOGF("[SOC] dt millis: %.5fh\n", elapsedHours);
     }
     float deltaSOC = (signedCurrentA * elapsedHours / BATTERY_CAPACITY_AH) * 100.0;
-    socEstimate = constrain(socEstimate + deltaSOC, 0.0, 100.0);
+    socEstimate += deltaSOC;
+    socEstimate = constrain(socEstimate, 0.0, 100.0);
+
+    // v9 rest-anchor: after 5 minutes near-idle, gently align to voltage SOC.
+    uint32_t nowMs = millis();
+    if (fabs(signedCurrentA) < SOC_IDLE_CURRENT_THRESH_A)
+    {
+        if (!isResting)
+        {
+            isResting = true;
+            restStartMs = nowMs;
+            anchorDone = false;
+            LOG("[SOC] Rest timer started");
+        }
+        else if (!anchorDone && (nowMs - restStartMs >= 300000UL))
+        {
+            float before = socEstimate;
+            socEstimate = (0.90f * socEstimate) + (0.10f * voltageSoc);
+            anchorDone = true;
+            LOGF("[SOC] 5min REST ANCHOR: %.1f%% -> %.1f%%\n", before, socEstimate);
+        }
+    }
+    else
+    {
+        if (isResting)
+        {
+            isResting = false;
+            anchorDone = false;
+            LOG("[SOC] Load detected - rest cancelled");
+        }
+    }
+
+    LOGF("[SOC] V=%.2f I=%+.3fA dSOC=%+.3f%% => %.1f%%\n",
+         rawVoltage, signedCurrentA, deltaSOC, socEstimate);
     return socEstimate;
 }
 
@@ -314,10 +355,33 @@ void restoreSOCFromNVS()
     float savedSOC = prefs.getFloat("soc", -1.0);
     uint32_t savedTS = prefs.getUInt("ts", 0);
     prefs.end();
-    if (savedSOC < 0.0 || savedSOC > 100.0) return;
+
+    if (savedSOC < 0.0 || savedSOC > 100.0)
+    {
+        LOG("[NVS] No saved SOC; seed from voltage");
+        return;
+    }
+
+    // v9-style restore guard against unrealistic jumps after reboot.
+    float shunt_mV = ina219.getShuntVoltage_mV();
+    float bus_V = ina219.getBusVoltage_V();
+    float liveVoltage = bus_V + (shunt_mV / 1000.0f);
+    if (liveVoltage >= 3.0f)
+    {
+        float liveSOC = voltageToSOC(liveVoltage, 0.0f);
+        float diff = fabs(savedSOC - liveSOC);
+        LOGF("[NVS] Saved=%.1f%% Live=%.1f%% Diff=%.1f%%\n", savedSOC, liveSOC, diff);
+        if (diff > SOC_REBOOT_MAX_DEVIATION)
+        {
+            LOG("[NVS] Saved SOC discarded (deviation too high)");
+            return;
+        }
+    }
+
     socEstimate = savedSOC;
     lastCoulombUnix = savedTS;
     lastCoulombMs = millis();
+    LOGF("[NVS] Restored SOC: %.1f%%\n", socEstimate);
 }
 
 void powerOnModem()
@@ -430,6 +494,12 @@ bool sendSensorData()
         return false;
     }
     LOGF("[DATA] Payload: %s\n", jsonBuf);
+    if (rtcAvailable && rtcTimeValid)
+    {
+        DateTime t = rtc.now();
+        LOGF("[RTC] Local: %04d-%02d-%02d %02d:%02d:%02d (server recordedAt is UTC)\n",
+             t.year(), t.month(), t.day(), t.hour(), t.minute(), t.second());
+    }
     int code = httpPost(DATA_PATH, jsonBuf, jsonLen, DEVICE_ID, DEVICE_SECRET);
     if (code == 201)
     {
