@@ -3,16 +3,16 @@
 // ─────────────────────────────────────────────────────────────────────
 //  Combined firmware:
 //    - Temperature sensors from v4 (3x DHT22, 1x DHT11)
-//    - Server registration + data sending from v4 (1 req/min)
 //    - SOC engine from v9 (RTC Coulomb counting + NVS + rest-detection)
 //    - Two separate I2C buses (INA219 on Wire, DS3231 on Wire1)
 // ═══════════════════════════════════════════════════════════════════════
 
 #include "config.h"
 #include <esp_task_wdt.h>
+#include <esp_err.h>
 
 // ── TinyGSM must be configured BEFORE the include ────────────────────
-#define TINY_GSM_MODEM_BG96
+#define TINY_GSM_MODEM_EC200U
 #define TINY_GSM_USE_GPRS true
 #define SerialAT Serial1
 #define SerialMon Serial
@@ -87,10 +87,6 @@ float    lastValidVoltage = 0.0;
 bool rtcAvailable = false;
 bool rtcTimeValid = false;
 
-// Cached RTC reading — updated once per second in updateSOCOnly()
-DateTime cachedRtcNow;
-uint32_t cachedRtcUnix = 0;
-
 // Rest-detection state for idle correction
 uint32_t restStartMs = 0;
 bool     isResting   = false;
@@ -135,8 +131,11 @@ void setup()
         .timeout_ms     = WDT_TIMEOUT_SECONDS * 1000,
         .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
         .trigger_panic  = true};
-    esp_task_wdt_init(&wdt_cfg);
-    esp_task_wdt_add(NULL);
+    esp_err_t wdtInitErr = esp_task_wdt_init(&wdt_cfg);
+    if (wdtInitErr == ESP_OK || wdtInitErr == ESP_ERR_INVALID_STATE)
+    {
+        esp_task_wdt_add(NULL);
+    }
 #else
     esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
     esp_task_wdt_add(NULL);
@@ -284,22 +283,35 @@ void syncRTCFromNetwork()
 
     if (dt.length() < 17)
     {
-        LOG("[RTC] ✗ Could not get valid time from modem — keeping current RTC");
+        LOG("[RTC] Could not get valid time from modem - keeping current RTC");
         return;
     }
 
-    int yr = dt.substring(0, 2).toInt() + 2000;
-    int mo = dt.substring(3, 5).toInt();
-    int dy = dt.substring(6, 8).toInt();
-    int hr = dt.substring(9, 11).toInt();
-    int mi = dt.substring(12, 14).toInt();
-    int sc = dt.substring(15, 17).toInt();
+    int yr = 0, mo = 0, dy = 0, hr = 0, mi = 0, sc = 0;
+    if (dt.length() >= 19 && dt.charAt(4) == '/')
+    {
+        yr = dt.substring(0, 4).toInt();
+        mo = dt.substring(5, 7).toInt();
+        dy = dt.substring(8, 10).toInt();
+        hr = dt.substring(11, 13).toInt();
+        mi = dt.substring(14, 16).toInt();
+        sc = dt.substring(17, 19).toInt();
+    }
+    else
+    {
+        yr = dt.substring(0, 2).toInt() + 2000;
+        mo = dt.substring(3, 5).toInt();
+        dy = dt.substring(6, 8).toInt();
+        hr = dt.substring(9, 11).toInt();
+        mi = dt.substring(12, 14).toInt();
+        sc = dt.substring(15, 17).toInt();
+    }
 
     // Sanity check
     if (yr < 2024 || yr > 2099 || mo < 1 || mo > 12 || dy < 1 || dy > 31 ||
         hr > 23 || mi > 59 || sc > 59)
     {
-        LOGF("[RTC] ✗ Invalid date/time: %04d-%02d-%02d %02d:%02d:%02d — skipping\n",
+        LOGF("[RTC] Invalid date/time: %04d-%02d-%02d %02d:%02d:%02d - skipping\n",
              yr, mo, dy, hr, mi, sc);
         return;
     }
@@ -307,7 +319,7 @@ void syncRTCFromNetwork()
     rtc.adjust(DateTime(yr, mo, dy, hr, mi, sc));
     rtcTimeValid = true;
 
-    LOGF("[RTC] ✓ Synced to network: %04d-%02d-%02d %02d:%02d:%02d\n",
+    LOGF("[RTC] Synced to network: %04d-%02d-%02d %02d:%02d:%02d\n",
          yr, mo, dy, hr, mi, sc);
 }
 
@@ -318,13 +330,6 @@ void syncRTCFromNetwork()
 
 void updateSOCOnly()
 {
-    // Cache RTC time once per second — all other functions use cached value
-    if (rtcAvailable && rtcTimeValid)
-    {
-        cachedRtcNow  = rtc.now();
-        cachedRtcUnix = cachedRtcNow.unixtime();
-    }
-
     // Read INA219
     float shunt_mV   = ina219.getShuntVoltage_mV();
     float bus_V      = ina219.getBusVoltage_V();
@@ -376,7 +381,7 @@ void readAllSensors()
         }
         else
         {
-            LOGF("[SENSOR]   Sensor #%d (DHT%d / GPIO %d) : ⚠ read failed — skipped\n",
+            LOGF("[SENSOR]   Sensor #%d (DHT%d / GPIO %d) : ! read failed - skipped\n",
                  i, dhtTypes[i], dhtPins[i]);
         }
         if ((i & 1) == 1)
@@ -417,9 +422,10 @@ void readAllSensors()
 
     if (rtcAvailable && rtcTimeValid)
     {
+        DateTime t = rtc.now();
         LOGF("[SENSOR]   RTC Time   : %04d-%02d-%02d %02d:%02d:%02d\n",
-             cachedRtcNow.year(), cachedRtcNow.month(), cachedRtcNow.day(),
-             cachedRtcNow.hour(), cachedRtcNow.minute(), cachedRtcNow.second());
+             t.year(), t.month(), t.day(),
+             t.hour(), t.minute(), t.second());
     }
 
     LOG("[SENSOR] ────────────\n");
@@ -471,10 +477,10 @@ float calculateSOC(float rawVoltage, float signedCurrentA)
         socEstimate = voltageSoc;
 
         if (rtcAvailable && rtcTimeValid)
-            lastCoulombUnix = cachedRtcUnix;
+            lastCoulombUnix = (uint32_t)rtc.now().unixtime();
         lastCoulombMs = millis();
 
-        LOGF("[SOC] ★ Seeded from voltage LUT: %.1f%%  (V=%.2f)\n",
+        LOGF("[SOC] Seeded from voltage LUT: %.1f%%  (V=%.2f)\n",
              socEstimate, rawVoltage);
         return socEstimate;
     }
@@ -484,7 +490,7 @@ float calculateSOC(float rawVoltage, float signedCurrentA)
 
     if (rtcAvailable && rtcTimeValid && lastCoulombUnix > 0)
     {
-        uint32_t nowUnix  = cachedRtcUnix;
+        uint32_t nowUnix  = (uint32_t)rtc.now().unixtime();
         uint32_t deltaSec = (nowUnix > lastCoulombUnix) ? (nowUnix - lastCoulombUnix) : 0;
 
         uint32_t maxSec = 180; // Sanity cap
@@ -534,7 +540,7 @@ float calculateSOC(float rawVoltage, float signedCurrentA)
             float before = socEstimate;
             socEstimate  = (0.90f * socEstimate) + (0.10f * voltageSoc);
             anchorDone   = true;
-            LOGF("[SOC] ★ 5min REST ANCHOR: %.1f%% → %.1f%%"
+            LOGF("[SOC] 5min REST ANCHOR: %.1f%% -> %.1f%%"
                  " (VLookup=%.1f%%)\n",
                  before, socEstimate, voltageSoc);
         }
@@ -580,7 +586,7 @@ void saveSOCToNVS()
     prefs.begin("crux", false);
     prefs.putFloat("soc", socEstimate);
     if (rtcAvailable && rtcTimeValid)
-        prefs.putUInt("ts", cachedRtcUnix);
+        prefs.putUInt("ts", (uint32_t)rtc.now().unixtime());
     prefs.end();
 }
 
@@ -678,6 +684,7 @@ void initModem()
     LOG("[MODEM] Name: " + name);
     LOG("[MODEM] Info: " + info);
 #if USE_HTTPS
+    netClient.setCACert(SERVER_CERT);
     LOG("[MODEM] TLS: modem hardware stack");
 #endif
     LOG("[MODEM] Ready\n");
@@ -688,7 +695,7 @@ void waitForNetwork()
     LOG("[NET] Scanning for 4G network...");
     if (!modem.waitForNetwork(NETWORK_TIMEOUT_MS, true))
     {
-        LOG("[NET] ✗ No network — rebooting in 30s");
+        LOG("[NET] No network - rebooting in 30s");
         delay(30000);
         ESP.restart();
     }
@@ -753,6 +760,7 @@ void registerWithRetry()
 
     for (int i = 1; i <= 5; i++)
     {
+        esp_task_wdt_reset();
         int code = httpPost(REGISTER_PATH, jsonBuf, jsonLen, nullptr, nullptr);
         if (code == 200 || code == 201)
         {
@@ -761,7 +769,12 @@ void registerWithRetry()
             return;
         }
         LOGF("[REG] Attempt %d failed (HTTP %d)\n", i, code);
-        delay(REGISTER_RETRY_MS);
+        uint32_t waitStart = millis();
+        while (millis() - waitStart < REGISTER_RETRY_MS)
+        {
+            esp_task_wdt_reset();
+            delay(100);
+        }
     }
     LOG("[REG] Will retry in main loop\n");
 }
@@ -817,6 +830,7 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
         }
 
         LOGF("[HTTP] Connect %s:%d\n", SERVER_HOST, SERVER_PORT);
+        esp_task_wdt_reset();
         if (!netClient.connect(SERVER_HOST, SERVER_PORT))
         {
             LOG("[HTTP] TCP failed");
@@ -869,8 +883,13 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
         netClient.write((const uint8_t *)body, bodyLen);
 
         uint32_t t0 = millis();
-        while (!netClient.available() && millis() - t0 < HTTP_TIMEOUT_MS)
+        while (!netClient.available() && millis() - t0 < HTTP_TIMEOUT_MS) {
             delay(50);
+            esp_task_wdt_reset();
+            if (!netClient.connected()) {
+                break;
+            }
+        }
 
         if (!netClient.available())
         {
@@ -898,6 +917,7 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
         while (netClient.available() && millis() - readStart < 3000 && respN < sizeof(respBuf) - 1)
         {
             respBuf[respN++] = (char)netClient.read();
+            esp_task_wdt_reset();
         }
         respBuf[respN] = '\0';
         if (respN > 0)
