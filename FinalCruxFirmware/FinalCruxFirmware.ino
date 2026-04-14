@@ -389,15 +389,24 @@ void registerWithRetry()
     doc["firmwareVersion"] = FIRMWARE_VER;
     char jsonBuf[JSON_SERIAL_BUFFER];
     size_t jsonLen = serializeJson(doc, jsonBuf, sizeof(jsonBuf));
-    if (jsonLen == 0 || jsonLen >= sizeof(jsonBuf)) return;
+    if (jsonLen == 0 || jsonLen >= sizeof(jsonBuf))
+    {
+        LOG("[REG] JSON serialize error or buffer full");
+        return;
+    }
     for (int i = 1; i <= 5; i++)
     {
         int code = httpPost(REGISTER_PATH, jsonBuf, jsonLen, nullptr, nullptr);
-        if (code == 200 || code == 201) { registered = true; LOG("[REG] Registered"); return; }
+        if (code == 200 || code == 201)
+        {
+            registered = true;
+            LOG("[REG] Registered\n");
+            return;
+        }
         LOGF("[REG] Attempt %d failed (HTTP %d)\n", i, code);
         delay(REGISTER_RETRY_MS);
     }
-    LOG("[REG] Will retry in main loop");
+    LOG("[REG] Will retry in main loop\n");
 }
 
 bool sendSensorData()
@@ -415,11 +424,22 @@ bool sendSensorData()
     doc["soc"] = round1(sensorSOC);
     char jsonBuf[JSON_SERIAL_BUFFER];
     size_t jsonLen = serializeJson(doc, jsonBuf, sizeof(jsonBuf));
-    if (jsonLen == 0 || jsonLen >= sizeof(jsonBuf)) return false;
+    if (jsonLen == 0 || jsonLen >= sizeof(jsonBuf))
+    {
+        LOG("[DATA] JSON serialize error");
+        return false;
+    }
+    LOGF("[DATA] Payload: %s\n", jsonBuf);
     int code = httpPost(DATA_PATH, jsonBuf, jsonLen, DEVICE_ID, DEVICE_SECRET);
+    if (code == 201)
+    {
+        LOG("[DATA] 201\n");
+        return true;
+    }
     LOGF("[DATA] HTTP %d\n", code);
-    if (code == 404) registered = false;
-    return code == 201;
+    if (code == 404)
+        registered = false;
+    return false;
 }
 
 static int httpPost(const char *path, const char *body, size_t bodyLen,
@@ -427,7 +447,12 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
 {
     for (int attempt = 1; attempt <= MAX_RETRIES; attempt++)
     {
-        if (attempt > 1) delay(RETRY_BACKOFF_MS * attempt);
+        if (attempt > 1)
+        {
+            LOGF("[HTTP] Retry %d/%d\n", attempt, MAX_RETRIES);
+            delay(RETRY_BACKOFF_MS * attempt);
+        }
+        LOGF("[HTTP] Connect %s:%d\n", SERVER_HOST, SERVER_PORT);
         if (!netClient.connect(SERVER_HOST, SERVER_PORT))
         {
             LOG("[HTTP] TCP failed");
@@ -443,38 +468,67 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
             "Content-Length: %u\r\n"
             "Connection: close\r\n",
             path, SERVER_HOST, (unsigned)bodyLen);
-        if (h <= 0 || (size_t)h >= sizeof(hdrs) - 96) { netClient.stop(); continue; }
+        if (h <= 0 || (size_t)h >= sizeof(hdrs) - 96)
+        {
+            LOG("[HTTP] header base truncated");
+            netClient.stop();
+            continue;
+        }
         int pos = h;
         if (devId && devSecret)
         {
             int a = snprintf(hdrs + pos, sizeof(hdrs) - (size_t)pos,
                              "x-device-id: %s\r\nx-device-secret: %s\r\n",
                              devId, devSecret);
-            if (a <= 0 || pos + a >= (int)sizeof(hdrs) - 8) { netClient.stop(); continue; }
+            if (a <= 0 || pos + a >= (int)sizeof(hdrs) - 8)
+            {
+                LOG("[HTTP] auth header truncated");
+                netClient.stop();
+                continue;
+            }
             pos += a;
         }
         int fin = snprintf(hdrs + pos, sizeof(hdrs) - (size_t)pos, "\r\n");
-        if (fin < 2) { netClient.stop(); continue; }
+        if (fin < 2)
+        {
+            netClient.stop();
+            continue;
+        }
         pos += fin;
         netClient.write((const uint8_t *)hdrs, (size_t)pos);
         netClient.write((const uint8_t *)body, bodyLen);
 
         uint32_t t0 = millis();
         while (!netClient.available() && millis() - t0 < HTTP_TIMEOUT_MS) delay(50);
-        if (!netClient.available()) { LOG("[HTTP] timeout"); netClient.stop(); continue; }
+        if (!netClient.available())
+        {
+            LOG("[HTTP] timeout");
+            netClient.stop();
+            continue;
+        }
         String statusLine = netClient.readStringUntil('\n');
         int statusCode = -1;
-        if (statusLine.length() > 12) statusCode = statusLine.substring(9, 12).toInt();
+        if (statusLine.length() > 12)
+            statusCode = statusLine.substring(9, 12).toInt();
         LOGF("[HTTP] <- %d\n", statusCode);
         while (netClient.available())
         {
             String line = netClient.readStringUntil('\n');
             if (line.length() <= 1) break;
         }
+        char respBuf[HTTP_RESP_BODY_MAX];
+        size_t respN = 0;
+        uint32_t readStart = millis();
+        while (netClient.available() && millis() - readStart < 3000 && respN < sizeof(respBuf) - 1)
+            respBuf[respN++] = (char)netClient.read();
+        respBuf[respN] = '\0';
+        if (respN > 0)
+            LOGF("[HTTP] Body: %s\n", respBuf);
         netClient.stop();
         if (statusCode >= 200 && statusCode < 300) return statusCode;
         if (statusCode >= 400 && statusCode < 500 && statusCode != 408 && statusCode != 429) return statusCode;
     }
+    LOG("[HTTP] all retries failed");
     return -1;
 }
 
