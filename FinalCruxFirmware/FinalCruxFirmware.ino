@@ -331,30 +331,42 @@ void powerOnModem()
 void initModem()
 {
     SerialAT.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
-    modem.init();
-    modem.restart();
+    LOG("[MODEM] Initializing...");
+    if (!modem.init()) LOG("[MODEM] init() failed");
+    if (!modem.restart()) LOG("[MODEM] restart() failed");
+    String name = modem.getModemName();
+    String info = modem.getModemInfo();
+    LOG("[MODEM] Name: " + name);
+    LOG("[MODEM] Info: " + info);
+    LOG("[MODEM] Ready");
 }
 
 void waitForNetwork()
 {
+    LOG("[NET] Scanning for 4G network...");
     if (!modem.waitForNetwork(NETWORK_TIMEOUT_MS, true))
     {
+        LOG("[NET] No network - rebooting");
         delay(30000);
         ESP.restart();
     }
+    LOGF("[NET] Registered (signal: %d/31)\n", modem.getSignalQuality());
 }
 
 void connectGPRS()
 {
+    LOG("[NET] Connecting GPRS...");
     if (!modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS))
     {
         delay(10000);
         if (!modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS))
         {
+            LOG("[NET] GPRS failed - rebooting");
             delay(5000);
             ESP.restart();
         }
     }
+    LOG("[NET] GPRS connected — IP: " + modem.getLocalIP());
 }
 
 void ensureConnected()
@@ -365,6 +377,7 @@ void ensureConnected()
 
 void registerWithRetry()
 {
+    LOG("[REG] Registering device...");
 #if CRUX_USE_JSONDOC_V6
     StaticJsonDocument<JSON_DOC_CAPACITY> doc;
 #else
@@ -380,13 +393,16 @@ void registerWithRetry()
     for (int i = 1; i <= 5; i++)
     {
         int code = httpPost(REGISTER_PATH, jsonBuf, jsonLen, nullptr, nullptr);
-        if (code == 200 || code == 201) { registered = true; return; }
+        if (code == 200 || code == 201) { registered = true; LOG("[REG] Registered"); return; }
+        LOGF("[REG] Attempt %d failed (HTTP %d)\n", i, code);
         delay(REGISTER_RETRY_MS);
     }
+    LOG("[REG] Will retry in main loop");
 }
 
 bool sendSensorData()
 {
+    LOG("[DATA] Sending...");
 #if CRUX_USE_JSONDOC_V6
     StaticJsonDocument<JSON_DOC_CAPACITY> doc;
 #else
@@ -401,6 +417,7 @@ bool sendSensorData()
     size_t jsonLen = serializeJson(doc, jsonBuf, sizeof(jsonBuf));
     if (jsonLen == 0 || jsonLen >= sizeof(jsonBuf)) return false;
     int code = httpPost(DATA_PATH, jsonBuf, jsonLen, DEVICE_ID, DEVICE_SECRET);
+    LOGF("[DATA] HTTP %d\n", code);
     if (code == 404) registered = false;
     return code == 201;
 }
@@ -413,6 +430,7 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
         if (attempt > 1) delay(RETRY_BACKOFF_MS * attempt);
         if (!netClient.connect(SERVER_HOST, SERVER_PORT))
         {
+            LOG("[HTTP] TCP failed");
             netClient.stop();
             continue;
         }
@@ -443,10 +461,11 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
 
         uint32_t t0 = millis();
         while (!netClient.available() && millis() - t0 < HTTP_TIMEOUT_MS) delay(50);
-        if (!netClient.available()) { netClient.stop(); continue; }
+        if (!netClient.available()) { LOG("[HTTP] timeout"); netClient.stop(); continue; }
         String statusLine = netClient.readStringUntil('\n');
         int statusCode = -1;
         if (statusLine.length() > 12) statusCode = statusLine.substring(9, 12).toInt();
+        LOGF("[HTTP] <- %d\n", statusCode);
         while (netClient.available())
         {
             String line = netClient.readStringUntil('\n');
