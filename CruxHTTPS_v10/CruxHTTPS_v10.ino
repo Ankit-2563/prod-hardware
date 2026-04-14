@@ -94,6 +94,15 @@ bool anchorDone = false;
 // Forward declaration
 static int httpPost(const char *path, const char *body, size_t bodyLen,
                     const char *devId, const char *devSecret);
+static inline void safeWdtReset()
+{
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    if (esp_task_wdt_status(NULL) == ESP_OK)
+        esp_task_wdt_reset();
+#else
+    esp_task_wdt_reset();
+#endif
+}
 
 // ═════════════════════════════════════════════════════════════════════
 //  SETUP
@@ -168,7 +177,7 @@ void loop()
              upSec / 60, upSec % 60, successCount, failCount);
     }
 
-    esp_task_wdt_reset();
+    safeWdtReset();
 
     uint32_t delayMs = LOOP_DELAY_MS;
 #if ADAPTIVE_LOOP_DELAY
@@ -288,11 +297,11 @@ void readAllSensors()
         }
         else
         {
-            LOGF("[SENSOR]   Sensor #%d (DHT%d / GPIO %d) : ⚠ read failed — skipped\n",
+            LOGF("[SENSOR]   Sensor #%d (DHT%d / GPIO %d) : read failed - skipped\n",
                  i, dhtTypes[i], dhtPins[i]);
         }
         if ((i & 1) == 1)
-            esp_task_wdt_reset();
+            safeWdtReset();
     }
 
     if (tempCount > 0)
@@ -315,7 +324,7 @@ void readAllSensors()
     else
         LOG("[SENSOR]   Humidity read failed, using previous value");
 
-    esp_task_wdt_reset();
+    safeWdtReset();
 
     // ── INA219 (voltage, current, power) ─────────────────────────────
     float shunt_mV = ina219.getShuntVoltage_mV();
