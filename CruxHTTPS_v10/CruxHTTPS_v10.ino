@@ -684,7 +684,11 @@ void initModem()
     LOG("[MODEM] Name: " + name);
     LOG("[MODEM] Info: " + info);
 #if USE_HTTPS
+#if !defined(TINY_GSM_MODEM_BG96)
+    // Some TinyGSM modem backends expose setCACert(), others don't.
+    // Keep this conditional so the sketch compiles on BG96 with TinyGSM 0.12.x.
     netClient.setCACert(SERVER_CERT);
+#endif
     LOG("[MODEM] TLS: modem hardware stack");
 #endif
     LOG("[MODEM] Ready\n");
