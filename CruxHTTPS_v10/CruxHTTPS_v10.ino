@@ -12,7 +12,7 @@
 #include <esp_err.h>
 
 // ── TinyGSM must be configured BEFORE the include ────────────────────
-#define TINY_GSM_MODEM_EC200U
+#define TINY_GSM_MODEM_BG96
 #define TINY_GSM_USE_GPRS true
 #define SerialAT Serial1
 #define SerialMon Serial
