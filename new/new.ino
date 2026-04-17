@@ -12,7 +12,7 @@
 #include <esp_task_wdt.h>
 
 // ── TinyGSM must be configured BEFORE the include ────────────────────
-#define TINY_GSM_MODEM_BG96
+#define TINY_GSM_MODEM_SIM7600
 #define TINY_GSM_USE_GPRS true
 #define SerialAT Serial1
 #define SerialMon Serial
@@ -128,7 +128,9 @@ void setup()
         .timeout_ms = WDT_TIMEOUT_SECONDS * 1000,
         .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
         .trigger_panic = true};
-    esp_task_wdt_init(&wdt_cfg);
+    esp_err_t wdt_err = esp_task_wdt_init(&wdt_cfg);
+    if (wdt_err == ESP_ERR_INVALID_STATE)
+        esp_task_wdt_reconfigure(&wdt_cfg);
     esp_task_wdt_add(NULL);
 #else
     esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
@@ -396,8 +398,14 @@ void initModem()
 {
     SerialAT.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
     LOG("[MODEM] Initializing...");
-    if (!modem.init()) LOG("[MODEM] init() failed");
-    if (!modem.restart()) LOG("[MODEM] restart() failed");
+    safeWdtReset();
+    if (!modem.init())
+    {
+        LOG("[MODEM] init() failed, trying restart...");
+        safeWdtReset();
+        if (!modem.restart()) LOG("[MODEM] restart() also failed");
+    }
+    safeWdtReset();
     String name = modem.getModemName();
     String info = modem.getModemInfo();
     LOG("[MODEM] Name: " + name);
@@ -408,10 +416,19 @@ void initModem()
 void waitForNetwork()
 {
     LOG("[NET] Scanning for 4G network...");
-    if (!modem.waitForNetwork(NETWORK_TIMEOUT_MS, true))
+    safeWdtReset();
+    uint32_t netStart = millis();
+    bool netOk = false;
+    while (millis() - netStart < NETWORK_TIMEOUT_MS)
+    {
+        safeWdtReset();
+        if (modem.isNetworkConnected()) { netOk = true; break; }
+        delay(500);
+    }
+    if (!netOk)
     {
         LOG("[NET] No network - rebooting");
-        delay(30000);
+        delay(5000);
         ESP.restart();
     }
     LOGF("[NET] Registered (signal: %d/31)\n", modem.getSignalQuality());
@@ -420,9 +437,12 @@ void waitForNetwork()
 void connectGPRS()
 {
     LOG("[NET] Connecting GPRS...");
+    safeWdtReset();
     if (!modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS))
     {
-        delay(10000);
+        safeWdtReset();
+        delay(5000);
+        safeWdtReset();
         if (!modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS))
         {
             LOG("[NET] GPRS failed - rebooting");
@@ -430,13 +450,17 @@ void connectGPRS()
             ESP.restart();
         }
     }
+    safeWdtReset();
     LOG("[NET] GPRS connected — IP: " + modem.getLocalIP());
 }
 
 void ensureConnected()
 {
+    safeWdtReset();
     if (!modem.isNetworkConnected()) { waitForNetwork(); connectGPRS(); }
+    safeWdtReset();
     if (!modem.isGprsConnected()) connectGPRS();
+    safeWdtReset();
 }
 
 void registerWithRetry()
@@ -460,6 +484,7 @@ void registerWithRetry()
     }
     for (int i = 1; i <= 5; i++)
     {
+        safeWdtReset();
         int code = httpPost(REGISTER_PATH, jsonBuf, jsonLen, nullptr, nullptr);
         if (code == 200 || code == 201)
         {
@@ -468,6 +493,7 @@ void registerWithRetry()
             return;
         }
         LOGF("[REG] Attempt %d failed (HTTP %d)\n", i, code);
+        safeWdtReset();
         delay(REGISTER_RETRY_MS);
     }
     LOG("[REG] Will retry in main loop\n");
@@ -569,7 +595,7 @@ static int httpPost(const char *path, const char *body, size_t bodyLen,
         netClient.write((const uint8_t *)body, bodyLen);
 
         uint32_t t0 = millis();
-        while (!netClient.available() && millis() - t0 < HTTP_TIMEOUT_MS) delay(50);
+        while (!netClient.available() && millis() - t0 < HTTP_TIMEOUT_MS) { safeWdtReset(); delay(50); }
         if (!netClient.available())
         {
             LOG("[HTTP] timeout");
